@@ -29,7 +29,7 @@ func TestCodexModelModalRightOpensSessionPicker(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	data := `{"payload":{"id":"session-123","timestamp":"2026-03-10T12:00:00Z","cwd":"` + cwd + `","git":{"branch":"main","repository_url":"https://github.com/acme/ollama.git"}}}` + "\n" +
+	data := `{"payload":{"id":"session-123","timestamp":"2026-03-10T12:00:00Z","cwd":"` + cwd + `","model_provider":"ollama","git":{"branch":"main","repository_url":"https://github.com/acme/ollama.git"}}}` + "\n" +
 		`{"payload":{"model":"qwen3:8b"}}` + "\n" +
 		`{"payload":{"type":"user_message","message":"Resume the previous fix and finish the tests."}}` + "\n"
 	if err := os.WriteFile(sessionPath, []byte(data), 0o644); err != nil {
@@ -40,7 +40,7 @@ func TestCodexModelModalRightOpensSessionPicker(t *testing.T) {
 		t.Fatalf("MkdirAll other: %v", err)
 	}
 	otherCWD := filepath.Join(home, "other-project")
-	otherData := `{"payload":{"id":"session-999","timestamp":"2026-03-10T11:00:00Z","cwd":"` + otherCWD + `","git":{"branch":"feature","repository_url":"https://github.com/acme/ollama.git"}}}` + "\n" +
+	otherData := `{"payload":{"id":"session-999","timestamp":"2026-03-10T11:00:00Z","cwd":"` + otherCWD + `","model_provider":"openai","git":{"branch":"feature","repository_url":"https://github.com/acme/ollama.git"}}}` + "\n" +
 		`{"payload":{"model":"glm-5:cloud"}}` + "\n"
 	if err := os.WriteFile(otherSessionPath, []byte(otherData), 0o644); err != nil {
 		t.Fatalf("WriteFile other: %v", err)
@@ -66,17 +66,14 @@ func TestCodexModelModalRightOpensSessionPicker(t *testing.T) {
 	if fm.modalSelector.selected != "qwen3:8b" {
 		t.Fatalf("selected model = %q, want qwen3:8b", fm.modalSelector.selected)
 	}
-	if len(fm.sessionSelector.items) != 2 {
-		t.Fatalf("len(sessionSelector.items) = %d, want 2", len(fm.sessionSelector.items))
+	if len(fm.sessionSelector.items) != 1 {
+		t.Fatalf("len(sessionSelector.items) = %d, want 1", len(fm.sessionSelector.items))
 	}
 	if fm.sessionSelector.items[0].Value != "session-123" {
 		t.Fatalf("session value = %q, want session-123", fm.sessionSelector.items[0].Value)
 	}
 	if !fm.sessionSelector.items[0].Recommended {
 		t.Fatal("expected matching-model session to be pinned as recommended")
-	}
-	if fm.sessionSelector.items[1].Recommended {
-		t.Fatal("expected non-matching model session to remain unpinned")
 	}
 	if !strings.Contains(fm.sessionSelector.items[0].Description, "qwen3:8b") {
 		t.Fatalf("session description = %q, want model metadata", fm.sessionSelector.items[0].Description)

@@ -221,18 +221,28 @@ func (m *model) openCodexSessionModal(selectedModel string) {
 	}
 
 	items := make([]SelectItem, len(sessions))
-	for i, session := range sessions {
+	var count int
+	for _, session := range sessions {
+		if session.Provider != "" && session.Provider != "ollama" {
+			continue
+		}
 		recommended := selectedModel != "" && session.Model != "" && session.Model == selectedModel
 		name := session.Title
 		if session.Model != "" {
 			name = fmt.Sprintf("%s  [%s]", name, session.Model)
 		}
-		items[i] = SelectItem{
+		items[count] = SelectItem{
 			Name:        name,
 			Value:       session.ID,
 			Description: session.Description,
 			Recommended: recommended,
 		}
+		count++
+	}
+	items = items[:count]
+	if len(items) == 0 {
+		m.statusMsg = "No Ollama-backed Codex sessions found."
+		return
 	}
 
 	m.showingModal = false

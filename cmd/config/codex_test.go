@@ -37,20 +37,21 @@ func TestListCodexSessions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	writeSession := func(rel, id, ts, cwd, extra string) {
+	writeSession := func(rel, id, ts, cwd, provider, extra string) {
 		path := filepath.Join(home, ".codex", "sessions", rel)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
-		data := `{"payload":{"id":"` + id + `","timestamp":"` + ts + `","cwd":"` + cwd + `","git":{"branch":"main","repository_url":"https://github.com/acme/repo.git"}}}` + "\n" + extra
+		data := `{"payload":{"id":"` + id + `","timestamp":"` + ts + `","cwd":"` + cwd + `","model_provider":"` + provider + `","git":{"branch":"main","repository_url":"https://github.com/acme/repo.git"}}}` + "\n" + extra
 		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 	}
 
-	writeSession("2026/03/10/a.jsonl", "older-session", "2026-03-10T10:00:00Z", "/repo", "")
-	writeSession("2026/03/10/b.jsonl", "newer-session", "2026-03-10T12:00:00Z", "/repo", `{"payload":{"message":"Fix the flaky Ollama test.","type":"user_message"}}`+"\n"+`{"payload":{"model":"qwen3:8b"}}`+"\n")
-	writeSession("2026/03/10/c.jsonl", "other-cwd", "2026-03-10T13:00:00Z", "/elsewhere", "")
+	writeSession("2026/03/10/a.jsonl", "older-session", "2026-03-10T10:00:00Z", "/repo", "ollama", "")
+	writeSession("2026/03/10/b.jsonl", "newer-session", "2026-03-10T12:00:00Z", "/repo", "ollama", `{"payload":{"message":"Fix the flaky Ollama test.","type":"user_message"}}`+"\n"+`{"payload":{"model":"qwen3:8b"}}`+"\n")
+	writeSession("2026/03/10/c.jsonl", "other-cwd", "2026-03-10T13:00:00Z", "/elsewhere", "openai", "")
+	writeSession("2026/03/10/d.jsonl", "older-session", "2026-03-10T09:00:00Z", "/repo", "ollama", "")
 
 	sessions, err := ListCodexSessions("/repo", 10)
 	if err != nil {
@@ -67,6 +68,9 @@ func TestListCodexSessions(t *testing.T) {
 	}
 	if sessions[0].Model != "qwen3:8b" {
 		t.Fatalf("sessions[0].Model = %q, want qwen3:8b", sessions[0].Model)
+	}
+	if sessions[0].Provider != "ollama" {
+		t.Fatalf("sessions[0].Provider = %q, want ollama", sessions[0].Provider)
 	}
 	if sessions[0].Repository != "repo" {
 		t.Fatalf("sessions[0].Repository = %q, want repo", sessions[0].Repository)
