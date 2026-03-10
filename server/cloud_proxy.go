@@ -120,6 +120,14 @@ func cloudPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
 		c.Set(cloudRequestedModelAliasKey, model)
 		c.Set(cloudRequestedModelBaseKey, modelRef.Base)
 
+		if c.Request.URL.Path == "/v1/responses" {
+			slog.Warn(
+				"cloud proxy responses request",
+				"model", model,
+				"body_prefix", summarizeResponsesBodyPrefix(body),
+			)
+		}
+
 		normalizedBody, err := replaceJSONModelField(body, modelRef.Base)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -292,12 +300,25 @@ func readRequestBody(r *http.Request) ([]byte, error) {
 		return nil, nil
 	}
 
-	body, err := io.ReadAll(r.Body)
+	reader := r.Body
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "zstd") {
+		zstdReader, err := zstd.NewReader(r.Body, zstd.WithDecoderMaxMemory(8<<20))
+		if err != nil {
+			return nil, err
+		}
+		defer zstdReader.Close()
+		reader = io.NopCloser(zstdReader)
+	}
+
+	body, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, err
 	}
 
 	r.Body = io.NopCloser(bytes.NewReader(body))
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "zstd") {
+		r.Header.Del("Content-Encoding")
+	}
 	return body, nil
 }
 
@@ -566,22 +587,96 @@ func copySanitizedResponsesJSON(dst http.ResponseWriter, src io.Reader, modelAli
 func copySanitizedResponsesEventStream(dst http.ResponseWriter, src io.Reader, modelAlias, modelBase string) error {
 	flusher, canFlush := dst.(http.Flusher)
 	reader := bufio.NewReader(src)
+	var currentEventType string
+	var skipCurrentEvent bool
+	var pendingEventLine []byte
+	var sawDoneSentinel bool
+	var sawAssistantOutputItemDone bool
 
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			if bytes.HasPrefix(line, []byte("event: ")) {
+				currentEventType = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event: "))))
+				skipCurrentEvent = shouldSkipResponsesEventType(currentEventType)
+				if currentEventType == "done" {
+					sawDoneSentinel = true
+				}
+				pendingEventLine = append(pendingEventLine[:0], line...)
+				if skipCurrentEvent {
+					goto nextLine
+				}
+				goto nextLine
+			}
+
 			out := line
 			if bytes.HasPrefix(line, []byte("data: ")) {
-				if sanitized, ok, sanitizeErr := sanitizeResponsesEventData(line, modelAlias, modelBase); sanitizeErr != nil {
+				if sanitized, ok, skip, sanitizeErr := sanitizeResponsesEventData(line, currentEventType, modelAlias, modelBase); sanitizeErr != nil {
 					slog.Warn(
 						"cloud proxy responses event sanitize failed",
 						"line_prefix", summarizeResponsesBodyPrefix(line),
 						"error", sanitizeErr,
 					)
 					return sanitizeErr
+				} else if skip {
+					skipCurrentEvent = true
+					goto nextLine
 				} else if ok {
+					if currentEventType == "response.output_item.done" && responsesEventContainsAssistantMessage(sanitized) {
+						sawAssistantOutputItemDone = true
+					}
+					if currentEventType == "response.completed" {
+						syntheticDoneEvents, synthErr := buildSyntheticAssistantOutputItemDoneEvents(sanitized)
+						if synthErr != nil {
+							return synthErr
+						}
+						if !sawAssistantOutputItemDone && len(syntheticDoneEvents) > 0 {
+							if len(pendingEventLine) > 0 && !bytes.Equal(line, pendingEventLine) {
+								if _, writeErr := dst.Write(pendingEventLine); writeErr != nil {
+									return writeErr
+								}
+								pendingEventLine = pendingEventLine[:0]
+							}
+							for _, synthetic := range syntheticDoneEvents {
+								if _, writeErr := dst.Write([]byte("event: response.output_item.done\n")); writeErr != nil {
+									return writeErr
+								}
+								if _, writeErr := dst.Write(synthetic); writeErr != nil {
+									return writeErr
+								}
+								if _, writeErr := dst.Write([]byte("\n")); writeErr != nil {
+									return writeErr
+								}
+								if canFlush {
+									flusher.Flush()
+								}
+							}
+							sawAssistantOutputItemDone = true
+						}
+					}
 					out = sanitized
 				}
+			}
+
+			if len(bytes.TrimSpace(line)) == 0 {
+				if skipCurrentEvent {
+					skipCurrentEvent = false
+					currentEventType = ""
+					pendingEventLine = pendingEventLine[:0]
+					goto nextLine
+				}
+				currentEventType = ""
+			}
+
+			if skipCurrentEvent {
+				goto nextLine
+			}
+
+			if len(pendingEventLine) > 0 && !bytes.Equal(line, pendingEventLine) {
+				if _, writeErr := dst.Write(pendingEventLine); writeErr != nil {
+					return writeErr
+				}
+				pendingEventLine = pendingEventLine[:0]
 			}
 
 			if _, writeErr := dst.Write(out); writeErr != nil {
@@ -592,8 +687,29 @@ func copySanitizedResponsesEventStream(dst http.ResponseWriter, src io.Reader, m
 			}
 		}
 
+	nextLine:
+
 		if err != nil {
 			if err == io.EOF {
+				if !sawDoneSentinel {
+					if _, writeErr := dst.Write([]byte("event: done\n")); writeErr != nil {
+						return writeErr
+					}
+					if _, writeErr := dst.Write([]byte("data: [DONE]\n\n")); writeErr != nil {
+						return writeErr
+					}
+					if canFlush {
+						flusher.Flush()
+					}
+				}
+				if len(pendingEventLine) > 0 && !skipCurrentEvent {
+					if _, writeErr := dst.Write(pendingEventLine); writeErr != nil {
+						return writeErr
+					}
+					if canFlush {
+						flusher.Flush()
+					}
+				}
 				return nil
 			}
 			return err
@@ -601,25 +717,96 @@ func copySanitizedResponsesEventStream(dst http.ResponseWriter, src io.Reader, m
 	}
 }
 
-func sanitizeResponsesEventData(line []byte, modelAlias, modelBase string) ([]byte, bool, error) {
+func sanitizeResponsesEventData(line []byte, eventType, modelAlias, modelBase string) ([]byte, bool, bool, error) {
 	payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data: ")))
 	if len(payload) == 0 {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 
 	first := payload[0]
 	if first != '{' && first != '[' {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 
-	sanitized, err := sanitizeResponsesPayload(payload, modelAlias, modelBase)
+	var parsed any
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return nil, false, false, err
+	}
+	if shouldSkipResponsesEventPayload(eventType, parsed) {
+		return nil, false, true, nil
+	}
+
+	sanitizedValue, drop := sanitizeResponsesValue(parsed, modelAlias, modelBase)
+	if drop {
+		return nil, false, true, nil
+	}
+	sanitized, err := json.Marshal(sanitizedValue)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 
 	out := append([]byte("data: "), sanitized...)
 	out = append(out, '\n')
-	return out, true, nil
+	return out, true, false, nil
+}
+
+func responsesEventContainsAssistantMessage(line []byte) bool {
+	payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data: ")))
+	var parsed map[string]any
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return false
+	}
+	item, _ := parsed["item"].(map[string]any)
+	if item == nil {
+		return false
+	}
+	itemType, _ := item["type"].(string)
+	role, _ := item["role"].(string)
+	return itemType == "message" && role == "assistant"
+}
+
+func buildSyntheticAssistantOutputItemDoneEvents(line []byte) ([][]byte, error) {
+	payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data: ")))
+	var parsed map[string]any
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return nil, err
+	}
+
+	response, _ := parsed["response"].(map[string]any)
+	if response == nil {
+		return nil, nil
+	}
+	output, _ := response["output"].([]any)
+	if len(output) == 0 {
+		return nil, nil
+	}
+
+	synthetic := make([][]byte, 0, len(output))
+	for index, rawItem := range output {
+		item, _ := rawItem.(map[string]any)
+		if item == nil {
+			continue
+		}
+		itemType, _ := item["type"].(string)
+		role, _ := item["role"].(string)
+		if itemType != "message" || role != "assistant" {
+			continue
+		}
+		event := map[string]any{
+			"type":         "response.output_item.done",
+			"output_index": index,
+			"item":         item,
+		}
+		marshaled, err := json.Marshal(event)
+		if err != nil {
+			return nil, err
+		}
+		line := append([]byte("data: "), marshaled...)
+		line = append(line, '\n')
+		synthetic = append(synthetic, line)
+	}
+
+	return synthetic, nil
 }
 
 func looksLikeResponsesEventStream(body []byte) bool {
@@ -653,27 +840,116 @@ func sanitizeResponsesPayload(body []byte, modelAlias, modelBase string) ([]byte
 		return nil, err
 	}
 
-	sanitizeResponsesValue(payload, modelAlias, modelBase)
-	return json.Marshal(payload)
+	sanitized, drop := sanitizeResponsesValue(payload, modelAlias, modelBase)
+	if drop {
+		return json.Marshal(map[string]any{})
+	}
+	return json.Marshal(sanitized)
 }
 
-func sanitizeResponsesValue(v any, modelAlias, modelBase string) {
+func sanitizeResponsesValue(v any, modelAlias, modelBase string) (any, bool) {
 	switch x := v.(type) {
 	case map[string]any:
 		if itemType, _ := x["type"].(string); itemType == "reasoning" {
-			delete(x, "encrypted_content")
+			return nil, true
+		}
+		if objectType, _ := x["object"].(string); objectType == "response" {
+			ensureCloudResponseShape(x)
+		}
+		if itemType, _ := x["type"].(string); itemType == "message" {
+			if role, _ := x["role"].(string); role == "assistant" {
+				if _, ok := x["phase"]; !ok {
+					x["phase"] = "final_answer"
+				}
+			}
 		}
 		if modelValue, _ := x["model"].(string); modelAlias != "" && modelBase != "" && modelValue == modelBase {
 			x["model"] = modelAlias
 		}
-		for _, value := range x {
-			sanitizeResponsesValue(value, modelAlias, modelBase)
+		for key, value := range x {
+			sanitized, drop := sanitizeResponsesValue(value, modelAlias, modelBase)
+			if drop {
+				delete(x, key)
+				continue
+			}
+			x[key] = sanitized
 		}
+		if responseValue, ok := x["response"].(map[string]any); ok {
+			ensureCloudResponseShape(responseValue)
+			x["response"] = responseValue
+		}
+		if outputIndex, ok := x["output_index"]; ok {
+			switch n := outputIndex.(type) {
+			case float64:
+				if n > 0 {
+					x["output_index"] = n - 1
+				}
+			case int:
+				if n > 0 {
+					x["output_index"] = n - 1
+				}
+			}
+		}
+		return x, false
 	case []any:
+		filtered := make([]any, 0, len(x))
 		for _, value := range x {
-			sanitizeResponsesValue(value, modelAlias, modelBase)
+			sanitized, drop := sanitizeResponsesValue(value, modelAlias, modelBase)
+			if drop {
+				continue
+			}
+			filtered = append(filtered, sanitized)
+		}
+		return filtered, false
+	}
+	return v, false
+}
+
+func ensureCloudResponseShape(x map[string]any) {
+	if reasoning, ok := x["reasoning"]; !ok || reasoning == nil {
+		x["reasoning"] = map[string]any{
+			"effort":  "none",
+			"summary": nil,
 		}
 	}
+	text, _ := x["text"].(map[string]any)
+	if text == nil {
+		text = map[string]any{}
+		x["text"] = text
+	}
+	if _, ok := text["format"]; !ok {
+		text["format"] = map[string]any{"type": "text"}
+	}
+	if _, ok := text["verbosity"]; !ok {
+		text["verbosity"] = "medium"
+	}
+	if _, ok := x["prompt_cache_retention"]; !ok {
+		x["prompt_cache_retention"] = nil
+	}
+	if _, ok := x["user"]; !ok {
+		x["user"] = nil
+	}
+	x["store"] = true
+}
+
+func shouldSkipResponsesEventType(eventType string) bool {
+	return strings.HasPrefix(eventType, "response.reasoning_")
+}
+
+func shouldSkipResponsesEventPayload(eventType string, payload any) bool {
+	if !strings.HasPrefix(eventType, "response.output_item.") {
+		return false
+	}
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return false
+	}
+	item, ok := m["item"].(map[string]any)
+	if !ok {
+		return false
+	}
+	itemType, _ := item["type"].(string)
+	return itemType == "reasoning"
 }
 
 func stringValue(v any) string {
