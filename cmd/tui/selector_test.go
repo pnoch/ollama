@@ -93,6 +93,18 @@ func TestFilteredItems(t *testing.T) {
 	}
 }
 
+func TestSelectItemSelectedValue(t *testing.T) {
+	item := SelectItem{Name: "visible", Value: "actual"}
+	if got := item.selectedValue(); got != "actual" {
+		t.Fatalf("selectedValue() = %q, want actual", got)
+	}
+
+	item = SelectItem{Name: "visible"}
+	if got := item.selectedValue(); got != "visible" {
+		t.Fatalf("selectedValue() fallback = %q, want visible", got)
+	}
+}
+
 func TestOtherStart(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -266,6 +278,29 @@ func TestRenderContent_SectionHeaders(t *testing.T) {
 	}
 	if !strings.Contains(content, "More") {
 		t.Error("should contain 'More' header")
+	}
+}
+
+func TestRenderContent_CustomSectionHeaders(t *testing.T) {
+	m := selectorModel{
+		title:             "Pick:",
+		recommendedHeader: "Matching Model",
+		otherHeader:       "Other Sessions",
+		items: []SelectItem{
+			{Name: "rec-a", Recommended: true},
+			{Name: "other-1"},
+		},
+	}
+	content := m.renderContent()
+
+	if !strings.Contains(content, "Matching Model") {
+		t.Error("should contain custom recommended header")
+	}
+	if !strings.Contains(content, "Other Sessions") {
+		t.Error("should contain custom other header")
+	}
+	if strings.Contains(content, "Recommended") {
+		t.Error("should not contain default recommended header when overridden")
 	}
 }
 

@@ -60,6 +60,7 @@ var ErrCancelled = errors.New("cancelled")
 
 type SelectItem struct {
 	Name        string
+	Value       string
 	Description string
 	Recommended bool
 }
@@ -68,9 +69,16 @@ type SelectItem struct {
 func ConvertItems(items []launch.ModelItem) []SelectItem {
 	out := make([]SelectItem, len(items))
 	for i, item := range items {
-		out[i] = SelectItem{Name: item.Name, Description: item.Description, Recommended: item.Recommended}
+		out[i] = SelectItem{Name: item.Name, Value: item.Name, Description: item.Description, Recommended: item.Recommended}
 	}
 	return out
+}
+
+func (i SelectItem) selectedValue() string {
+	if i.Value != "" {
+		return i.Value
+	}
+	return i.Name
 }
 
 // ReorderItems returns a copy with recommended items first, then non-recommended,
@@ -90,15 +98,31 @@ func ReorderItems(items []SelectItem) []SelectItem {
 
 // selectorModel is the bubbletea model for single selection.
 type selectorModel struct {
-	title        string
-	items        []SelectItem
-	filter       string
-	cursor       int
-	scrollOffset int
-	selected     string
-	cancelled    bool
-	helpText     string
-	width        int
+	title             string
+	items             []SelectItem
+	filter            string
+	cursor            int
+	scrollOffset      int
+	selected          string
+	cancelled         bool
+	helpText          string
+	recommendedHeader string
+	otherHeader       string
+	width             int
+}
+
+func (m selectorModel) recommendedSectionHeader() string {
+	if m.recommendedHeader != "" {
+		return m.recommendedHeader
+	}
+	return "Recommended"
+}
+
+func (m selectorModel) otherSectionHeader() string {
+	if m.otherHeader != "" {
+		return m.otherHeader
+	}
+	return "More"
 }
 
 func selectorModelWithCurrent(title string, items []SelectItem, current string) selectorModel {
@@ -245,7 +269,7 @@ func (m selectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyEnter:
 			filtered := m.filteredItems()
 			if len(filtered) > 0 && m.cursor < len(filtered) {
-				m.selected = filtered[m.cursor].Name
+				m.selected = filtered[m.cursor].selectedValue()
 			}
 			return m, tea.Quit
 
@@ -320,7 +344,7 @@ func (m selectorModel) renderContent() string {
 
 		// Always render all recommended items (pinned)
 		if len(recItems) > 0 {
-			s.WriteString(sectionHeaderStyle.Render("Recommended"))
+			s.WriteString(sectionHeaderStyle.Render(m.recommendedSectionHeader()))
 			s.WriteString("\n")
 			for _, idx := range recItems {
 				m.renderItem(&s, filtered[idx], idx)
@@ -329,7 +353,7 @@ func (m selectorModel) renderContent() string {
 
 		if len(otherItems) > 0 {
 			s.WriteString("\n")
-			s.WriteString(sectionHeaderStyle.Render("More"))
+			s.WriteString(sectionHeaderStyle.Render(m.otherSectionHeader()))
 			s.WriteString("\n")
 
 			maxOthers := maxSelectorItems - len(recItems)

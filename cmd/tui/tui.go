@@ -69,14 +69,18 @@ var othersMenuItem = menuItem{
 }
 
 type model struct {
-	state      *launch.LauncherState
-	items      []menuItem
-	cursor     int
-	showOthers bool
-	width      int
-	quitting   bool
-	selected   bool
-	action     TUIAction
+	state               *launch.LauncherState
+	items               []menuItem
+	cursor              int
+	showOthers          bool
+	width               int
+	quitting            bool
+	selected            bool
+	action              TUIAction
+	// session resume state
+	showingSessionModal bool
+	sessionSelector     selectorModel
+	selectedSessionID   string
 }
 
 func newModel(state *launch.LauncherState) model {
@@ -175,6 +179,39 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Session modal takes priority
+	if m.showingSessionModal {
+		if kmsg, ok := msg.(tea.KeyMsg); ok {
+			switch kmsg.Type {
+			case tea.KeyCtrlC, tea.KeyEsc, tea.KeyLeft:
+				m.showingSessionModal = false
+				return m, nil
+			case tea.KeyEnter:
+				filtered := m.sessionSelector.filteredItems()
+				if len(filtered) > 0 && m.sessionSelector.cursor < len(filtered) {
+					m.selectedSessionID = filtered[m.sessionSelector.cursor].selectedValue()
+				}
+				if m.selectedSessionID != "" {
+					item := m.items[m.cursor]
+					integrationState := m.state.Integrations[item.integration]
+					m.selected = true
+					m.action = TUIAction{
+						Kind:          TUIActionLaunchIntegration,
+						Integration:   item.integration,
+						ModelOverride: integrationState.CurrentModel,
+						SessionID:     m.selectedSessionID,
+					}
+					m.quitting = true
+					return m, tea.Quit
+				}
+				return m, nil
+			default:
+				m.sessionSelector.updateNavigation(kmsg)
+			}
+		}
+		return m, nil
+	}
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -218,6 +255,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "right", "l":
 			item := m.items[m.cursor]
+			if item.integration == "codex" && m.changeableItem(item) {
+				// For Codex, right opens session picker
+				integrationState := m.state.Integrations[item.integration]
+				m.openCodexSessionModal(integrationState.CurrentModel)
+				return m, nil
+			}
 			if item.isRunModel || m.changeableItem(item) {
 				m.selected = true
 				m.action = actionForMenuItem(item, true)
@@ -227,8 +270,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
-
 	return m, nil
+}
+
+// openCodexSessionModal opens the session picker for the given Codex model.
+func (m *model) openCodexSessionModal(selectedModel string) {
+	sessions, err := launch.ListCodexSessions("", 30)
+	if err != nil || len(sessions) == 0 {
+		return
+	}
+	items := make([]SelectItem, len(sessions))
+	for i, session := range sessions {
+		recommended := selectedModel != "" && session.Model != "" && session.Model == selectedModel
+		name := session.Title
+		if session.Model != "" {
+			name = fmt.Sprintf("%s  [%s]", name, session.Model)
+		}
+		items[i] = SelectItem{
+			Name:        name,
+			Value:       session.ID,
+			Description: session.Description,
+			Recommended: recommended,
+		}
+	}
+	title := "Resume Codex session:"
+	if selectedModel != "" {
+		title = fmt.Sprintf("Resume Codex session for %s:", selectedModel)
+	}
+	m.sessionSelector = selectorModel{
+		title:             title,
+		items:             ReorderItems(items),
+		helpText:          "\u2191/\u2193 navigate \u2022 enter resume \u2022 matching model sessions pinned first \u2022 \u2190 back",
+		recommendedHeader: "Matching Model",
+		otherHeader:       "Other Sessions",
+	}
+	m.showingSessionModal = true
 }
 
 func (m model) selectableItem(item menuItem) bool {
@@ -253,6 +329,14 @@ func (m model) changeableItem(item menuItem) bool {
 func (m model) View() string {
 	if m.quitting {
 		return ""
+	}
+
+	if m.showingSessionModal {
+		content := m.sessionSelector.renderContent()
+		if m.width > 0 {
+			return lipgloss.NewStyle().MaxWidth(m.width).Render(content)
+		}
+		return content
 	}
 
 	s := selectorTitleStyle.Render("Ollama "+versionStyle.Render(version.Version)) + "\n\n"
@@ -340,6 +424,8 @@ type TUIAction struct {
 	Kind           TUIActionKind
 	Integration    string
 	ForceConfigure bool
+	ModelOverride  string // model to use when resuming
+	SessionID      string // session id if resuming a Codex session
 }
 
 func (a TUIAction) LastSelection() string {
@@ -358,10 +444,15 @@ func (a TUIAction) RunModelRequest() launch.RunModelRequest {
 }
 
 func (a TUIAction) IntegrationLaunchRequest() launch.IntegrationLaunchRequest {
-	return launch.IntegrationLaunchRequest{
+	req := launch.IntegrationLaunchRequest{
 		Name:           a.Integration,
+		ModelOverride:  a.ModelOverride,
 		ForceConfigure: a.ForceConfigure,
 	}
+	if a.SessionID != "" {
+		req.ExtraArgs = []string{"resume", a.SessionID}
+	}
+	return req
 }
 
 func actionForMenuItem(item menuItem, forceConfigure bool) TUIAction {

@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -174,5 +176,102 @@ func TestMenuShowsInstallStatusAndHint(t *testing.T) {
 	}
 	if !strings.Contains(view, codex.InstallHint) {
 		t.Fatalf("expected install hint in description\n%s", view)
+	}
+}
+
+// ---- Session resume tests ----
+
+func TestCodexRightOpensSessionPicker(t *testing.T) {
+	// Create a fake codex session so ListCodexSessions returns something.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sessionPath := filepath.Join(home, ".codex", "sessions", "2026", "03", "10", "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	data := `{"payload":{"id":"session-123","timestamp":"2026-03-10T12:00:00Z","cwd":"/tmp","git":{}}}` + "\n" +
+		`{"payload":{"model":"qwen3:8b"}}` + "\n" +
+		`{"payload":{"type":"user_message","message":"Fix the bug."}}` + "\n"
+	if err := os.WriteFile(sessionPath, []byte(data), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	state := launcherTestState()
+	codex := state.Integrations["codex"]
+	codex.CurrentModel = "qwen3:8b"
+	state.Integrations["codex"] = codex
+
+	menu := newModel(state)
+	// cursor 2 = codex in the default menu
+	menu.cursor = 2
+
+	updated, _ := menu.Update(tea.KeyMsg{Type: tea.KeyRight})
+	got := updated.(model)
+
+	if !got.showingSessionModal {
+		t.Fatal("expected showingSessionModal=true after right on codex")
+	}
+	if len(got.sessionSelector.items) == 0 {
+		t.Fatal("expected session selector to have items")
+	}
+}
+
+func TestCodexSessionPickerEnterSelectsSession(t *testing.T) {
+	menu := model{
+		state: launcherTestState(),
+		items: []menuItem{{integration: "codex"}},
+		showingSessionModal: true,
+		sessionSelector: selectorModel{
+			items: ReorderItems([]SelectItem{
+				{Name: "Fix the bug  [qwen3:8b]", Value: "session-123", Recommended: true},
+			}),
+		},
+	}
+
+	updated, _ := menu.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := updated.(model)
+
+	if !got.selected {
+		t.Fatal("expected selected=true after enter in session picker")
+	}
+	if got.action.Kind != TUIActionLaunchIntegration {
+		t.Fatalf("action.Kind = %v, want TUIActionLaunchIntegration", got.action.Kind)
+	}
+	if got.action.Integration != "codex" {
+		t.Fatalf("action.Integration = %q, want codex", got.action.Integration)
+	}
+	if got.action.SessionID != "session-123" {
+		t.Fatalf("action.SessionID = %q, want session-123", got.action.SessionID)
+	}
+}
+
+func TestIntegrationLaunchRequestWithSessionID(t *testing.T) {
+	action := TUIAction{
+		Kind:        TUIActionLaunchIntegration,
+		Integration: "codex",
+		SessionID:   "session-abc",
+	}
+	req := action.IntegrationLaunchRequest()
+	if len(req.ExtraArgs) != 2 || req.ExtraArgs[0] != "resume" || req.ExtraArgs[1] != "session-abc" {
+		t.Fatalf("ExtraArgs = %v, want [resume session-abc]", req.ExtraArgs)
+	}
+}
+
+func TestSessionPickerEscClosesModal(t *testing.T) {
+	menu := model{
+		state: launcherTestState(),
+		items: []menuItem{{integration: "codex"}},
+		showingSessionModal: true,
+		sessionSelector: selectorModel{
+			items: []SelectItem{{Name: "session", Value: "s1"}},
+		},
+	}
+	updated, _ := menu.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := updated.(model)
+	if got.showingSessionModal {
+		t.Fatal("expected showingSessionModal=false after esc")
+	}
+	if got.selected {
+		t.Fatal("expected selected=false after esc")
 	}
 }
