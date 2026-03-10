@@ -282,9 +282,6 @@ func (m *model) openCodexSessionModal(selectedModel string) {
 	items := make([]SelectItem, len(sessions))
 	var count int
 	for _, session := range sessions {
-		if session.Provider != "" && session.Provider != "ollama" {
-			continue
-		}
 		recommended := selectedModel != "" && session.Model != "" && session.Model == selectedModel
 		name := session.Title
 		if session.Model != "" {
@@ -300,7 +297,7 @@ func (m *model) openCodexSessionModal(selectedModel string) {
 	}
 	items = items[:count]
 	if len(items) == 0 {
-		m.statusMsg = "No Ollama-backed Codex sessions found."
+		m.statusMsg = "No Codex sessions found."
 		return
 	}
 	title := "Resume Codex session:"

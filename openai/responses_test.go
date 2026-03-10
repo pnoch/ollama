@@ -998,11 +998,11 @@ func TestResponsesStreamConverter_Reasoning(t *testing.T) {
 	if events[1].Event != "response.output_item.done" {
 		t.Errorf("events[1].Event = %q, want %q", events[1].Event, "response.output_item.done")
 	}
-	// Check the reasoning done item has encrypted_content
+	// Check the reasoning done item does not emit fake encrypted_content
 	doneData := events[1].Data.(map[string]any)
 	doneItem := doneData["item"].(map[string]any)
-	if doneItem["encrypted_content"] != "Let me think..." {
-		t.Errorf("encrypted_content = %q, want %q", doneItem["encrypted_content"], "Let me think...")
+	if _, ok := doneItem["encrypted_content"]; ok {
+		t.Errorf("encrypted_content should be omitted, got %q", doneItem["encrypted_content"])
 	}
 }
 
@@ -1284,8 +1284,8 @@ func TestToResponse_WithReasoning(t *testing.T) {
 	if response.Output[0].Summary[0].Text != "Analyzing the question..." {
 		t.Errorf("Summary[0].Text = %q, want %q", response.Output[0].Summary[0].Text, "Analyzing the question...")
 	}
-	if response.Output[0].EncryptedContent != "Analyzing the question..." {
-		t.Errorf("EncryptedContent = %q, want %q", response.Output[0].EncryptedContent, "Analyzing the question...")
+	if response.Output[0].EncryptedContent != "" {
+		t.Errorf("EncryptedContent = %q, want empty", response.Output[0].EncryptedContent)
 	}
 
 	// Second item should be message
