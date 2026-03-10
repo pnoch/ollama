@@ -1,9 +1,11 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -80,5 +82,65 @@ func TestListCodexSessions(t *testing.T) {
 	}
 	if sessions[0].Prompt != "Fix the flaky Ollama test." {
 		t.Fatalf("sessions[0].Prompt = %q", sessions[0].Prompt)
+	}
+}
+
+func TestCodexModelCatalogArg(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cachePath := filepath.Join(home, ".codex", "models_cache.json")
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cache := `{"fetched_at":"2026-03-10T00:00:00Z","client_version":"0.113.0","models":[{"slug":"gpt-5.4","display_name":"gpt-5.4","description":"Latest frontier agentic coding model.","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low","description":"Low"},{"effort":"medium","description":"Medium"},{"effort":"high","description":"High"}],"shell_type":"shell_command","visibility":"list","supported_in_api":true,"priority":0,"availability_nux":null,"upgrade":null,"base_instructions":"base","instructions_variables":{},"supports_reasoning_summaries":true,"default_reasoning_summary":"none","support_verbosity":true,"default_verbosity":"low","apply_patch_tool_type":"freeform","web_search_tool_type":"text","truncation_policy":{"mode":"tokens","limit":10000},"supports_parallel_tool_calls":true,"supports_image_detail_original":true,"context_window":272000,"effective_context_window_percent":95,"experimental_supported_tools":[],"input_modalities":["text"],"prefer_websockets":true,"auto_compact_token_limit":258400}]}` + "\n"
+	if err := os.WriteFile(cachePath, []byte(cache), 0o644); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+
+	arg, cleanup, err := codexModelCatalogArg("minimax-m2.5:cloud")
+	if err != nil {
+		t.Fatalf("codexModelCatalogArg() error = %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("cleanup = nil, want non-nil")
+	}
+	if !strings.HasPrefix(arg, `model_catalog_json="`) {
+		t.Fatalf("arg = %q, want model_catalog_json path", arg)
+	}
+
+	path := strings.TrimPrefix(arg, `model_catalog_json="`)
+	path = strings.TrimSuffix(path, `"`)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read generated catalog: %v", err)
+	}
+
+	var catalog codexModelCatalog
+	if err := json.Unmarshal(data, &catalog); err != nil {
+		t.Fatalf("unmarshal generated catalog: %v", err)
+	}
+	if len(catalog.Models) != 2 {
+		t.Fatalf("len(catalog.Models) = %d, want 2", len(catalog.Models))
+	}
+
+	entry := catalog.Models[1]
+	if entry["slug"] != "minimax-m2.5:cloud" {
+		t.Fatalf("entry slug = %v, want minimax-m2.5:cloud", entry["slug"])
+	}
+	if entry["context_window"] != float64(204800) {
+		t.Fatalf("entry context_window = %v, want 204800", entry["context_window"])
+	}
+	if entry["auto_compact_token_limit"] != float64(194560) {
+		t.Fatalf("entry auto_compact_token_limit = %v, want 194560", entry["auto_compact_token_limit"])
+	}
+	if entry["prefer_websockets"] != false {
+		t.Fatalf("entry prefer_websockets = %v, want false", entry["prefer_websockets"])
+	}
+
+	cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("generated catalog still exists after cleanup, err = %v", err)
 	}
 }

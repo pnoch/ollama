@@ -50,7 +50,16 @@ func (c *Codex) Run(model string, args []string) error {
 		return err
 	}
 
-	cmd := exec.Command("codex", c.args(model, args)...)
+	cmdArgs := c.args(model, args)
+	catalogArg, cleanup, err := codexModelCatalogArg(model)
+	if err == nil && catalogArg != "" {
+		cmdArgs = append(cmdArgs[:len(cmdArgs)-len(args)], append([]string{"-c", catalogArg}, cmdArgs[len(cmdArgs)-len(args):]...)...)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	cmd := exec.Command("codex", cmdArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -321,4 +330,101 @@ func compactPrompt(s string) string {
 		return s[:69] + "..."
 	}
 	return s
+}
+
+type codexModelCatalog struct {
+	FetchedAt     string           `json:"fetched_at,omitempty"`
+	ETag          string           `json:"etag,omitempty"`
+	ClientVersion string           `json:"client_version,omitempty"`
+	Models        []map[string]any `json:"models"`
+}
+
+func codexModelCatalogArg(model string) (string, func(), error) {
+	limit, ok := lookupCloudModelLimit(model)
+	if !ok {
+		return "", nil, nil
+	}
+
+	catalog, err := readCodexModelCatalogTemplate()
+	if err != nil {
+		return "", nil, err
+	}
+	if len(catalog.Models) == 0 {
+		return "", nil, nil
+	}
+
+	entry, err := cloneCodexCatalogEntry(catalog.Models[0])
+	if err != nil {
+		return "", nil, err
+	}
+
+	entry["slug"] = model
+	entry["display_name"] = model
+	entry["description"] = codexModelDescription(model)
+	entry["priority"] = 100
+	entry["availability_nux"] = nil
+	entry["upgrade"] = nil
+	entry["context_window"] = limit.Context
+	entry["effective_context_window_percent"] = 95
+	entry["auto_compact_token_limit"] = limit.Context * 95 / 100
+	entry["prefer_websockets"] = false
+
+	catalog.Models = append(catalog.Models, entry)
+
+	f, err := os.CreateTemp("", "ollama-codex-model-catalog-*.json")
+	if err != nil {
+		return "", nil, err
+	}
+	defer f.Close()
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(catalog); err != nil {
+		_ = os.Remove(f.Name())
+		return "", nil, err
+	}
+
+	return fmt.Sprintf(`model_catalog_json=%q`, f.Name()), func() {
+		_ = os.Remove(f.Name())
+	}, nil
+}
+
+func readCodexModelCatalogTemplate() (codexModelCatalog, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return codexModelCatalog{}, err
+	}
+
+	data, err := os.ReadFile(filepath.Join(home, ".codex", "models_cache.json"))
+	if err != nil {
+		return codexModelCatalog{}, err
+	}
+
+	var catalog codexModelCatalog
+	if err := json.Unmarshal(data, &catalog); err != nil {
+		return codexModelCatalog{}, err
+	}
+	return catalog, nil
+}
+
+func cloneCodexCatalogEntry(entry map[string]any) (map[string]any, error) {
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return nil, err
+	}
+
+	var cloned map[string]any
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		return nil, err
+	}
+	return cloned, nil
+}
+
+func codexModelDescription(model string) string {
+	for _, item := range recommendedModels {
+		if item.Name == model {
+			return item.Description
+		}
+	}
+	return model
 }
