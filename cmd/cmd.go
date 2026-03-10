@@ -2063,6 +2063,17 @@ func runInteractiveTUI(cmd *cobra.Command) {
 				if err := config.LaunchIntegrationWithModel(result.Integration, result.Models[0]); err != nil {
 					fmt.Fprintf(os.Stderr, "Error launching %s: %v\n", result.Integration, err)
 				}
+			} else if result.SessionID != "" && result.Model != "" {
+				if config.IsCloudModelDisabled(cmd.Context(), result.Model) {
+					continue
+				}
+				if err := config.SaveIntegration(result.Integration, []string{result.Model}); err != nil {
+					fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+					continue
+				}
+				if err := config.LaunchIntegrationWithModel(result.Integration, result.Model, "resume", result.SessionID); err != nil {
+					fmt.Fprintf(os.Stderr, "Error launching %s: %v\n", result.Integration, err)
+				}
 			} else if result.Model != "" {
 				if config.IsCloudModelDisabled(cmd.Context(), result.Model) {
 					continue

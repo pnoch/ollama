@@ -761,7 +761,7 @@ func LaunchIntegration(name string) error {
 }
 
 // LaunchIntegrationWithModel launches the named integration with the specified model.
-func LaunchIntegrationWithModel(name, modelName string) error {
+func LaunchIntegrationWithModel(name, modelName string, args ...string) error {
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
 		return err
@@ -769,7 +769,7 @@ func LaunchIntegrationWithModel(name, modelName string) error {
 	if err := ShowOrPull(context.Background(), client, modelName); err != nil {
 		return err
 	}
-	return runIntegration(name, modelName, nil)
+	return runIntegration(name, modelName, args)
 }
 
 // SaveAndEditIntegration saves the models for an Editor integration and runs its Edit method

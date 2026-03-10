@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -128,6 +129,10 @@ type model struct {
 	showingMultiModal  bool
 	multiModalSelector multiSelectorModel
 
+	showingSessionModal bool
+	sessionSelector     selectorModel
+	selectedSessionID   string
+
 	showingSignIn   bool
 	signInURL       string
 	signInModel     string
@@ -174,7 +179,7 @@ func (m *model) buildModalItems() []SelectItem {
 	return ReorderItems(ConvertItems(modelItems))
 }
 
-func (m *model) openModelModal(currentModel string) {
+func (m *model) openModelModal(currentModel string, canResumeSession bool) {
 	m.modalItems = m.buildModalItems()
 	cursor := 0
 	if currentModel != "" {
@@ -185,14 +190,64 @@ func (m *model) openModelModal(currentModel string) {
 			}
 		}
 	}
+	helpText := "↑/↓ navigate • enter select • ← back"
+	if canResumeSession {
+		helpText = "↑/↓ navigate • enter select • → resume session • ← back"
+	}
 	m.modalSelector = selectorModel{
 		title:    "Select model:",
 		items:    m.modalItems,
 		cursor:   cursor,
-		helpText: "↑/↓ navigate • enter select • ← back",
+		helpText: helpText,
 	}
 	m.modalSelector.updateScroll(m.modalSelector.otherStart())
 	m.showingModal = true
+}
+
+func (m *model) openCodexSessionModal(selectedModel string) {
+	if _, err := os.Getwd(); err != nil {
+		m.statusMsg = "Unable to determine current directory for Codex sessions."
+		return
+	}
+
+	sessions, err := config.ListCodexSessions("", 30)
+	if err != nil {
+		m.statusMsg = "Unable to read Codex sessions."
+		return
+	}
+	if len(sessions) == 0 {
+		m.statusMsg = "No Codex sessions found."
+		return
+	}
+
+	items := make([]SelectItem, len(sessions))
+	for i, session := range sessions {
+		recommended := selectedModel != "" && session.Model != "" && session.Model == selectedModel
+		name := session.Title
+		if session.Model != "" {
+			name = fmt.Sprintf("%s  [%s]", name, session.Model)
+		}
+		items[i] = SelectItem{
+			Name:        name,
+			Value:       session.ID,
+			Description: session.Description,
+			Recommended: recommended,
+		}
+	}
+
+	m.showingModal = false
+	title := "Resume Codex session:"
+	if selectedModel != "" {
+		title = fmt.Sprintf("Resume Codex session for %s:", selectedModel)
+	}
+	m.sessionSelector = selectorModel{
+		title:             title,
+		items:             ReorderItems(items),
+		helpText:          "↑/↓ navigate • enter resume • matching model sessions are pinned first • ← back",
+		recommendedHeader: "Matching Model",
+		otherHeader:       "Other Sessions",
+	}
+	m.showingSessionModal = true
 }
 
 func (m *model) openMultiModelModal(integration string) {
@@ -469,6 +524,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.showingSessionModal {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.Type {
+			case tea.KeyCtrlC, tea.KeyEsc, tea.KeyLeft:
+				m.showingSessionModal = false
+				m.showingModal = true
+				return m, nil
+			case tea.KeyEnter:
+				filtered := m.sessionSelector.filteredItems()
+				if len(filtered) > 0 && m.sessionSelector.cursor < len(filtered) {
+					m.selectedSessionID = filtered[m.sessionSelector.cursor].selectedValue()
+				}
+				if m.selectedSessionID != "" {
+					m.changeModel = true
+					m.quitting = true
+					return m, tea.Quit
+				}
+				return m, nil
+			default:
+				m.sessionSelector.updateNavigation(msg)
+			}
+		}
+		return m, nil
+	}
+
 	if m.showingModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -480,7 +561,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.KeyEnter:
 				filtered := m.modalSelector.filteredItems()
 				if len(filtered) > 0 && m.modalSelector.cursor < len(filtered) {
-					m.modalSelector.selected = filtered[m.modalSelector.cursor].Name
+					m.modalSelector.selected = filtered[m.modalSelector.cursor].selectedValue()
 				}
 				if m.modalSelector.selected != "" {
 					if cmd := m.checkCloudSignIn(m.modalSelector.selected, true); cmd != nil {
@@ -489,6 +570,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.changeModel = true
 					m.quitting = true
 					return m, tea.Quit
+				}
+				return m, nil
+
+			case tea.KeyRight:
+				if m.items[m.cursor].integration == "codex" {
+					filtered := m.modalSelector.filteredItems()
+					if len(filtered) > 0 && m.modalSelector.cursor < len(filtered) {
+						m.modalSelector.selected = filtered[m.modalSelector.cursor].selectedValue()
+					}
+					if m.modalSelector.selected != "" {
+						m.openCodexSessionModal(m.modalSelector.selected)
+					}
 				}
 				return m, nil
 
@@ -549,7 +642,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if item.integration != "" && config.IsEditorIntegration(item.integration) {
 					m.openMultiModelModal(item.integration)
 				} else {
-					m.openModelModal(configuredModel)
+					m.openModelModal(configuredModel, item.integration == "codex")
 				}
 				return m, nil
 			}
@@ -579,7 +672,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else if item.integration != "" {
 						currentModel = config.IntegrationModel(item.integration)
 					}
-					m.openModelModal(currentModel)
+					m.openModelModal(currentModel, item.integration == "codex")
 				}
 			}
 		}
@@ -603,6 +696,10 @@ func (m model) View() string {
 
 	if m.showingModal {
 		return m.renderModal()
+	}
+
+	if m.showingSessionModal {
+		return m.renderSessionModal()
 	}
 
 	s := selectorTitleStyle.Render("Ollama "+versionStyle.Render(version.Version)) + "\n\n"
@@ -659,6 +756,9 @@ func (m model) View() string {
 				desc = "not installed"
 			}
 		}
+		if item.integration == "codex" && m.cursor == i {
+			desc += "\n" + selectorHelpStyle.Render("Press →, then → again on a model, to resume a past session")
+		}
 		s += menuDescStyle.Render(desc) + "\n\n"
 	}
 
@@ -686,6 +786,18 @@ func (m model) renderModal() string {
 	return s
 }
 
+func (m model) renderSessionModal() string {
+	modalStyle := lipgloss.NewStyle().
+		PaddingBottom(1).
+		PaddingRight(2)
+
+	s := modalStyle.Render(m.sessionSelector.renderContent())
+	if m.width > 0 {
+		return lipgloss.NewStyle().MaxWidth(m.width).Render(s)
+	}
+	return s
+}
+
 func (m model) renderSignInDialog() string {
 	return renderSignIn(m.signInModel, m.signInURL, m.signInSpinner, m.width)
 }
@@ -705,6 +817,7 @@ type Result struct {
 	Integration string   // integration name if applicable
 	Model       string   // model name if selected from single-select modal
 	Models      []string // models selected from multi-select modal (Editor integrations)
+	SessionID   string   // session id if resuming an integration session
 }
 
 func Run() (Result, error) {
@@ -721,8 +834,12 @@ func Run() (Result, error) {
 		return Result{Selection: SelectionNone}, fm.err
 	}
 
+	return resultFromModel(fm), nil
+}
+
+func resultFromModel(fm model) Result {
 	if !fm.selected && !fm.changeModel {
-		return Result{Selection: SelectionNone}, nil
+		return Result{Selection: SelectionNone}
 	}
 
 	item := fm.items[fm.cursor]
@@ -732,22 +849,23 @@ func Run() (Result, error) {
 			return Result{
 				Selection: SelectionChangeRunModel,
 				Model:     fm.modalSelector.selected,
-			}, nil
+			}
 		}
 		return Result{
 			Selection:   SelectionChangeIntegration,
 			Integration: item.integration,
 			Model:       fm.modalSelector.selected,
 			Models:      fm.changeModels,
-		}, nil
+			SessionID:   fm.selectedSessionID,
+		}
 	}
 
 	if item.isRunModel {
-		return Result{Selection: SelectionRunModel}, nil
+		return Result{Selection: SelectionRunModel}
 	}
 
 	return Result{
 		Selection:   SelectionIntegration,
 		Integration: item.integration,
-	}, nil
+	}
 }
