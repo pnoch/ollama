@@ -734,6 +734,231 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 			t.Fatalf("expected upstream path /v1/models/kimi-k2.5:latest, got %q", capture.path)
 		}
 	})
+
+	t.Run("v1 responses strips encrypted content from json", func(t *testing.T) {
+		upstream, capture := newUpstream(t, `{"id":"resp_1","object":"response","model":"minimax-m2.5","output":[{"id":"rs_1","type":"reasoning","encrypted_content":"plain text","summary":[{"type":"summary_text","text":"plain text"}]},{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"ok"}]}]}`)
+		defer upstream.Close()
+
+		original := cloudProxyBaseURL
+		cloudProxyBaseURL = upstream.URL
+		t.Cleanup(func() { cloudProxyBaseURL = original })
+
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{"model":"minimax-m2.5:cloud","input":"hello","stream":false}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if capture.path != "/v1/responses" {
+			t.Fatalf("expected upstream path /v1/responses, got %q", capture.path)
+		}
+		if bytes.Contains(body, []byte(`"encrypted_content"`)) {
+			t.Fatalf("expected encrypted_content to be stripped, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`"model":"minimax-m2.5:cloud"`)) {
+			t.Fatalf("expected model alias to be restored, got %s", string(body))
+		}
+	})
+
+	t.Run("v1 responses strips encrypted content from event stream", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "event: response.output_item.done\n")
+			_, _ = io.WriteString(w, "data: {\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"plain text\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"plain text\"}]},\"type\":\"response.output_item.done\"}\n\n")
+			_, _ = io.WriteString(w, "event: response.completed\n")
+			_, _ = io.WriteString(w, "data: {\"response\":{\"id\":\"resp_1\",\"model\":\"minimax-m2.5\",\"output\":[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"plain text\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"plain text\"}]}]},\"type\":\"response.completed\"}\n\n")
+		}))
+		defer upstream.Close()
+
+		original := cloudProxyBaseURL
+		cloudProxyBaseURL = upstream.URL
+		t.Cleanup(func() { cloudProxyBaseURL = original })
+
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{"model":"minimax-m2.5:cloud","input":"hello","stream":true}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+			t.Fatalf("expected event-stream content type, got %q", resp.Header.Get("Content-Type"))
+		}
+		if bytes.Contains(body, []byte(`"encrypted_content"`)) {
+			t.Fatalf("expected encrypted_content to be stripped, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`"model":"minimax-m2.5:cloud"`)) {
+			t.Fatalf("expected model alias to be restored, got %s", string(body))
+		}
+	})
+
+	t.Run("v1 responses detects event stream despite json content type", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "event: response.output_item.done\n")
+			_, _ = io.WriteString(w, "data: {\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"plain text\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"plain text\"}]},\"type\":\"response.output_item.done\"}\n\n")
+			_, _ = io.WriteString(w, "event: response.completed\n")
+			_, _ = io.WriteString(w, "data: {\"response\":{\"id\":\"resp_1\",\"model\":\"minimax-m2.5\",\"output\":[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"plain text\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"plain text\"}]}]},\"type\":\"response.completed\"}\n\n")
+		}))
+		defer upstream.Close()
+
+		original := cloudProxyBaseURL
+		cloudProxyBaseURL = upstream.URL
+		t.Cleanup(func() { cloudProxyBaseURL = original })
+
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{"model":"minimax-m2.5:cloud","input":"hello","stream":true}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if !bytes.Contains(body, []byte("event: response.completed")) {
+			t.Fatalf("expected completed event in body, got %s", string(body))
+		}
+		if bytes.Contains(body, []byte(`"encrypted_content"`)) {
+			t.Fatalf("expected encrypted_content to be stripped for JSON-classified responses, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`"model":"minimax-m2.5:cloud"`)) {
+			t.Fatalf("expected model alias to be restored, got %s", string(body))
+		}
+	})
+
+	t.Run("v1 responses passes through non-json data frames", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "event: response.created\n")
+			_, _ = io.WriteString(w, "data: ephemeral-control-frame\n\n")
+			_, _ = io.WriteString(w, "event: response.output_item.done\n")
+			_, _ = io.WriteString(w, "data: {\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"plain text\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"plain text\"}]},\"type\":\"response.output_item.done\"}\n\n")
+			_, _ = io.WriteString(w, "event: response.completed\n")
+			_, _ = io.WriteString(w, "data: {\"response\":{\"id\":\"resp_1\",\"model\":\"minimax-m2.5\",\"output\":[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"plain text\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"plain text\"}]}]},\"type\":\"response.completed\"}\n\n")
+		}))
+		defer upstream.Close()
+
+		original := cloudProxyBaseURL
+		cloudProxyBaseURL = upstream.URL
+		t.Cleanup(func() { cloudProxyBaseURL = original })
+
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{"model":"minimax-m2.5:cloud","input":"hello","stream":true}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if !bytes.Contains(body, []byte("data: ephemeral-control-frame")) {
+			t.Fatalf("expected non-json data frame to pass through, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte("event: response.completed")) {
+			t.Fatalf("expected completed event in body, got %s", string(body))
+		}
+		if bytes.Contains(body, []byte(`"encrypted_content"`)) {
+			t.Fatalf("expected encrypted_content to be stripped, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`"model":"minimax-m2.5:cloud"`)) {
+			t.Fatalf("expected model alias to be restored, got %s", string(body))
+		}
+	})
+}
+
+func TestCopySanitizedResponsesJSONFallsBackToEventStream(t *testing.T) {
+	rec := httptest.NewRecorder()
+	body := "event: response.output_item.done\n" +
+		"data: {\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"plain text\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"plain text\"}]},\"type\":\"response.output_item.done\"}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"response\":{\"id\":\"resp_1\",\"model\":\"minimax-m2.5\",\"output\":[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"plain text\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"plain text\"}]}]},\"type\":\"response.completed\"}\n\n"
+
+	if err := copySanitizedResponsesJSON(rec, strings.NewReader(body), "minimax-m2.5:cloud", "minimax-m2.5"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := rec.Body.Bytes()
+	if !bytes.Contains(got, []byte("event: response.completed")) {
+		t.Fatalf("expected completed event in body, got %s", string(got))
+	}
+	if bytes.Contains(got, []byte(`"encrypted_content"`)) {
+		t.Fatalf("expected encrypted_content to be stripped, got %s", string(got))
+	}
+	if !bytes.Contains(got, []byte(`"model":"minimax-m2.5:cloud"`)) {
+		t.Fatalf("expected model alias to be restored, got %s", string(got))
+	}
 }
 
 func TestCloudDisabledBlocksExplicitCloudPassthrough(t *testing.T) {

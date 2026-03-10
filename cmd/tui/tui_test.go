@@ -66,8 +66,8 @@ func TestCodexModelModalRightOpensSessionPicker(t *testing.T) {
 	if fm.modalSelector.selected != "qwen3:8b" {
 		t.Fatalf("selected model = %q, want qwen3:8b", fm.modalSelector.selected)
 	}
-	if len(fm.sessionSelector.items) != 1 {
-		t.Fatalf("len(sessionSelector.items) = %d, want 1", len(fm.sessionSelector.items))
+	if len(fm.sessionSelector.items) != 2 {
+		t.Fatalf("len(sessionSelector.items) = %d, want 2", len(fm.sessionSelector.items))
 	}
 	if fm.sessionSelector.items[0].Value != "session-123" {
 		t.Fatalf("session value = %q, want session-123", fm.sessionSelector.items[0].Value)
@@ -77,6 +77,12 @@ func TestCodexModelModalRightOpensSessionPicker(t *testing.T) {
 	}
 	if !strings.Contains(fm.sessionSelector.items[0].Description, "qwen3:8b") {
 		t.Fatalf("session description = %q, want model metadata", fm.sessionSelector.items[0].Description)
+	}
+	if fm.sessionSelector.items[1].Value != "session-999" {
+		t.Fatalf("session value = %q, want session-999", fm.sessionSelector.items[1].Value)
+	}
+	if fm.sessionSelector.items[1].Recommended {
+		t.Fatal("expected non-matching session to stay in other sessions")
 	}
 	if fm.sessionSelector.recommendedHeader != "Matching Model" {
 		t.Fatalf("recommendedHeader = %q, want Matching Model", fm.sessionSelector.recommendedHeader)

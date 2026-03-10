@@ -1338,3 +1338,33 @@ func TestResponsesMiddlewareZstd(t *testing.T) {
 		})
 	}
 }
+
+func TestResponsesMiddlewareBypassesCloudModels(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+
+	var body []byte
+	router.Use(ResponsesMiddleware())
+	router.Handle(http.MethodPost, "/v1/responses", func(c *gin.Context) {
+		var err error
+		body, err = io.ReadAll(c.Request.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Status(http.StatusOK)
+	})
+
+	reqBody := `{"model":"minimax-m2.5:cloud","input":"Hello","stream":true}`
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if string(body) != reqBody {
+		t.Fatalf("expected request body to pass through unchanged, got %s", string(body))
+	}
+}

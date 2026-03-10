@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -29,6 +30,8 @@ const (
 	cloudProxyBaseURLEnv          = "OLLAMA_CLOUD_BASE_URL"
 	legacyCloudAnthropicKey       = "legacy_cloud_anthropic_web_search"
 	cloudProxyClientVersionHeader = "X-Ollama-Client-Version"
+	cloudRequestedModelAliasKey  = "cloud_requested_model_alias"
+	cloudRequestedModelBaseKey   = "cloud_requested_model_base"
 )
 
 var (
@@ -96,6 +99,9 @@ func cloudPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
 			return
 		}
 
+		c.Set(cloudRequestedModelAliasKey, model)
+		c.Set(cloudRequestedModelBaseKey, modelRef.Base)
+
 		normalizedBody, err := replaceJSONModelField(body, modelRef.Base)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -131,6 +137,9 @@ func cloudModelPathPassthroughMiddleware(disabledOperation string) gin.HandlerFu
 			c.Next()
 			return
 		}
+
+		c.Set(cloudRequestedModelAliasKey, modelName)
+		c.Set(cloudRequestedModelBaseKey, modelRef.Base)
 
 		proxyPath := "/v1/models/" + modelRef.Base
 		proxyCloudRequestWithPath(c, nil, proxyPath, disabledOperation)
@@ -209,7 +218,16 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 	copyProxyResponseHeaders(c.Writer.Header(), resp.Header)
 	c.Status(resp.StatusCode)
 
-	if err := copyProxyResponseBody(c.Writer, resp.Body); err != nil {
+	requestedModelAlias, _ := c.Get(cloudRequestedModelAliasKey)
+	requestedModelBase, _ := c.Get(cloudRequestedModelBaseKey)
+	if err := copyProxyResponseBody(
+		c.Writer,
+		resp.Body,
+		path,
+		resp.Header.Get("Content-Type"),
+		stringValue(requestedModelAlias),
+		stringValue(requestedModelBase),
+	); err != nil {
 		ctxErr := c.Request.Context().Err()
 		if errors.Is(err, context.Canceled) && errors.Is(ctxErr, context.Canceled) {
 			slog.Debug(
@@ -430,7 +448,29 @@ func copyProxyResponseHeaders(dst, src http.Header) {
 	}
 }
 
-func copyProxyResponseBody(dst http.ResponseWriter, src io.Reader) error {
+func copyProxyResponseBody(dst http.ResponseWriter, src io.Reader, path, contentType, modelAlias, modelBase string) error {
+	if path == "/v1/responses" {
+		reader := bufio.NewReader(src)
+		format, sample := detectResponsesProxyFormat(reader, contentType)
+		slog.Warn(
+			"cloud proxy responses format detected",
+			"path", path,
+			"content_type", contentType,
+			"detected_format", format,
+			"body_prefix", sample,
+		)
+		switch format {
+		case "event-stream":
+			return copySanitizedResponsesEventStream(dst, reader, modelAlias, modelBase)
+		case "json":
+			return copySanitizedResponsesJSON(dst, reader, modelAlias, modelBase)
+		}
+	}
+
+	return copyProxyStream(dst, src)
+}
+
+func copyProxyStream(dst http.ResponseWriter, src io.Reader) error {
 	flusher, canFlush := dst.(http.Flusher)
 	buf := make([]byte, 32*1024)
 
@@ -454,6 +494,173 @@ func copyProxyResponseBody(dst http.ResponseWriter, src io.Reader) error {
 			return err
 		}
 	}
+}
+
+func detectResponsesProxyFormat(r *bufio.Reader, contentType string) (string, string) {
+	contentType = strings.ToLower(contentType)
+	if strings.Contains(contentType, "text/event-stream") {
+		return "event-stream", ""
+	}
+
+	peek, err := r.Peek(4096)
+	sample := summarizeResponsesBodyPrefix(peek)
+	if err == nil || errors.Is(err, bufio.ErrBufferFull) || errors.Is(err, io.EOF) {
+		if looksLikeResponsesEventStream(peek) {
+			return "event-stream", sample
+		}
+
+		trimmed := bytes.TrimSpace(peek)
+		if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+			return "json", sample
+		}
+	}
+
+	if strings.Contains(contentType, "application/json") {
+		return "json", sample
+	}
+
+	return "", sample
+}
+
+func copySanitizedResponsesJSON(dst http.ResponseWriter, src io.Reader, modelAlias, modelBase string) error {
+	body, err := io.ReadAll(src)
+	if err != nil {
+		return err
+	}
+
+	sanitized, err := sanitizeResponsesPayload(body, modelAlias, modelBase)
+	if err != nil {
+		if looksLikeResponsesEventStream(body) {
+			return copySanitizedResponsesEventStream(dst, bytes.NewReader(body), modelAlias, modelBase)
+		}
+		slog.Warn(
+			"cloud proxy responses json sanitize failed",
+			"body_prefix", summarizeResponsesBodyPrefix(body),
+			"error", err,
+		)
+		return err
+	}
+
+	_, err = dst.Write(sanitized)
+	return err
+}
+
+func copySanitizedResponsesEventStream(dst http.ResponseWriter, src io.Reader, modelAlias, modelBase string) error {
+	flusher, canFlush := dst.(http.Flusher)
+	reader := bufio.NewReader(src)
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			out := line
+			if bytes.HasPrefix(line, []byte("data: ")) {
+				if sanitized, ok, sanitizeErr := sanitizeResponsesEventData(line, modelAlias, modelBase); sanitizeErr != nil {
+					slog.Warn(
+						"cloud proxy responses event sanitize failed",
+						"line_prefix", summarizeResponsesBodyPrefix(line),
+						"error", sanitizeErr,
+					)
+					return sanitizeErr
+				} else if ok {
+					out = sanitized
+				}
+			}
+
+			if _, writeErr := dst.Write(out); writeErr != nil {
+				return writeErr
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func sanitizeResponsesEventData(line []byte, modelAlias, modelBase string) ([]byte, bool, error) {
+	payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data: ")))
+	if len(payload) == 0 {
+		return nil, false, nil
+	}
+
+	first := payload[0]
+	if first != '{' && first != '[' {
+		return nil, false, nil
+	}
+
+	sanitized, err := sanitizeResponsesPayload(payload, modelAlias, modelBase)
+	if err != nil {
+		return nil, false, err
+	}
+
+	out := append([]byte("data: "), sanitized...)
+	out = append(out, '\n')
+	return out, true, nil
+}
+
+func looksLikeResponsesEventStream(body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return false
+	}
+
+	return bytes.HasPrefix(trimmed, []byte("event:")) ||
+		bytes.HasPrefix(trimmed, []byte("data:")) ||
+		bytes.Contains(trimmed, []byte("\nevent:")) ||
+		bytes.Contains(trimmed, []byte("\ndata:"))
+}
+
+func summarizeResponsesBodyPrefix(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+
+	if len(body) > 160 {
+		body = body[:160]
+	}
+
+	replacer := strings.NewReplacer("\r", "\\r", "\n", "\\n", "\t", "\\t")
+	return replacer.Replace(string(body))
+}
+
+func sanitizeResponsesPayload(body []byte, modelAlias, modelBase string) ([]byte, error) {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+
+	sanitizeResponsesValue(payload, modelAlias, modelBase)
+	return json.Marshal(payload)
+}
+
+func sanitizeResponsesValue(v any, modelAlias, modelBase string) {
+	switch x := v.(type) {
+	case map[string]any:
+		if itemType, _ := x["type"].(string); itemType == "reasoning" {
+			delete(x, "encrypted_content")
+		}
+		if modelValue, _ := x["model"].(string); modelAlias != "" && modelBase != "" && modelValue == modelBase {
+			x["model"] = modelAlias
+		}
+		for _, value := range x {
+			sanitizeResponsesValue(value, modelAlias, modelBase)
+		}
+	case []any:
+		for _, value := range x {
+			sanitizeResponsesValue(value, modelAlias, modelBase)
+		}
+	}
+}
+
+func stringValue(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func isHopByHopHeader(name string) bool {

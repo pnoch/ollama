@@ -508,6 +508,21 @@ func ResponsesMiddleware() gin.HandlerFunc {
 			c.Request.Header.Del("Content-Encoding")
 		}
 
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
+			return
+		}
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+
+		var modelOnly struct {
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(body, &modelOnly); err == nil && strings.HasSuffix(strings.TrimSpace(modelOnly.Model), ":cloud") {
+			c.Next()
+			return
+		}
+
 		var req openai.ResponsesRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))

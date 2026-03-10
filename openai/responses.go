@@ -645,7 +645,6 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 					Text: chatResponse.Message.Thinking,
 				},
 			},
-			EncryptedContent: chatResponse.Message.Thinking, // Plain text for now
 		})
 	}
 
@@ -1025,10 +1024,9 @@ func (c *ResponsesStreamConverter) finishReasoning() []ResponsesStreamEvent {
 		c.newEvent("response.output_item.done", map[string]any{
 			"output_index": c.outputIndex,
 			"item": map[string]any{
-				"id":                c.reasoningItemID,
-				"type":              "reasoning",
-				"summary":           []map[string]any{{"type": "summary_text", "text": c.accumulatedThinking}},
-				"encrypted_content": c.accumulatedThinking, // Plain text for now
+				"id":      c.reasoningItemID,
+				"type":    "reasoning",
+				"summary": []map[string]any{{"type": "summary_text", "text": c.accumulatedThinking}},
 			},
 		}),
 	}
@@ -1162,10 +1160,9 @@ func (c *ResponsesStreamConverter) buildFinalOutput() []any {
 	// Add reasoning item if present
 	if c.reasoningStarted {
 		output = append(output, map[string]any{
-			"id":                c.reasoningItemID,
-			"type":              "reasoning",
-			"summary":           []map[string]any{{"type": "summary_text", "text": c.accumulatedThinking}},
-			"encrypted_content": c.accumulatedThinking,
+			"id":      c.reasoningItemID,
+			"type":    "reasoning",
+			"summary": []map[string]any{{"type": "summary_text", "text": c.accumulatedThinking}},
 		})
 	}
 
