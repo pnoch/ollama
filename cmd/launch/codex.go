@@ -25,6 +25,7 @@ func (c *Codex) String() string { return "Codex" }
 
 type CodexSession struct {
 	ID          string
+	Provider    string
 	Model       string
 	Branch      string
 	Repository  string
@@ -130,6 +131,7 @@ func ListCodexSessions(cwd string, limit int) ([]CodexSession, error) {
 			return strings.Compare(a.ID, b.ID)
 		}
 	})
+	sessions = dedupeCodexSessions(sessions)
 
 	if limit > 0 && len(sessions) > limit {
 		sessions = sessions[:limit]
@@ -143,6 +145,7 @@ type codexSessionMeta struct {
 		ID        string `json:"id"`
 		Timestamp string `json:"timestamp"`
 		CWD       string `json:"cwd"`
+		Provider  string `json:"model_provider"`
 		Git       struct {
 			Branch        string `json:"branch"`
 			RepositoryURL string `json:"repository_url"`
@@ -202,6 +205,7 @@ func readCodexSessionMeta(path string) (CodexSession, bool) {
 	}
 
 	return CodexSession{
+		Provider:    meta.Payload.Provider,
 		Model:       model,
 		Branch:      meta.Payload.Git.Branch,
 		Repository:  repoLabel,
@@ -212,6 +216,19 @@ func readCodexSessionMeta(path string) (CodexSession, bool) {
 		CWD:         meta.Payload.CWD,
 		Timestamp:   timestamp,
 	}, true
+}
+
+func dedupeCodexSessions(sessions []CodexSession) []CodexSession {
+	seen := make(map[string]struct{}, len(sessions))
+	deduped := make([]CodexSession, 0, len(sessions))
+	for _, session := range sessions {
+		if _, ok := seen[session.ID]; ok {
+			continue
+		}
+		seen[session.ID] = struct{}{}
+		deduped = append(deduped, session)
+	}
+	return deduped
 }
 
 func readFirstLine(r io.Reader) ([]byte, error) {

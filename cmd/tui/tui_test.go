@@ -189,11 +189,22 @@ func TestCodexRightOpensSessionPicker(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	data := `{"payload":{"id":"session-123","timestamp":"2026-03-10T12:00:00Z","cwd":"/tmp","git":{}}}` + "\n" +
+	cwd := t.TempDir()
+	data := `{"payload":{"id":"session-123","timestamp":"2026-03-10T12:00:00Z","cwd":"` + cwd + `","model_provider":"ollama","git":{"branch":"main","repository_url":"https://github.com/acme/ollama.git"}}}` + "\n" +
 		`{"payload":{"model":"qwen3:8b"}}` + "\n" +
 		`{"payload":{"type":"user_message","message":"Fix the bug."}}` + "\n"
 	if err := os.WriteFile(sessionPath, []byte(data), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
+	}
+	otherSessionPath := filepath.Join(home, ".codex", "sessions", "2026", "03", "09", "session-other.jsonl")
+	if err := os.MkdirAll(filepath.Dir(otherSessionPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll other: %v", err)
+	}
+	otherCWD := filepath.Join(home, "other-project")
+	otherData := `{"payload":{"id":"session-999","timestamp":"2026-03-10T11:00:00Z","cwd":"` + otherCWD + `","model_provider":"openai","git":{"branch":"feature","repository_url":"https://github.com/acme/ollama.git"}}}` + "\n" +
+		`{"payload":{"model":"glm-5:cloud"}}` + "\n"
+	if err := os.WriteFile(otherSessionPath, []byte(otherData), 0o644); err != nil {
+		t.Fatalf("WriteFile other: %v", err)
 	}
 
 	state := launcherTestState()
@@ -211,9 +222,25 @@ func TestCodexRightOpensSessionPicker(t *testing.T) {
 	if !got.showingSessionModal {
 		t.Fatal("expected showingSessionModal=true after right on codex")
 	}
-	if len(got.sessionSelector.items) == 0 {
-		t.Fatal("expected session selector to have items")
+	if len(got.sessionSelector.items) != 1 {
+		t.Fatalf("len(sessionSelector.items) = %d, want 1 (openai session should be filtered)", len(got.sessionSelector.items))
 	}
+	if got.sessionSelector.items[0].Value != "session-123" {
+		t.Fatalf("session value = %q, want session-123", got.sessionSelector.items[0].Value)
+	}
+	if !got.sessionSelector.items[0].Recommended {
+		t.Fatal("expected matching-model session to be pinned as recommended")
+	}
+	if !strings.Contains(got.sessionSelector.items[0].Description, "qwen3:8b") {
+		t.Fatalf("session description = %q, want model metadata", got.sessionSelector.items[0].Description)
+	}
+	if got.sessionSelector.recommendedHeader != "Matching Model" {
+		t.Fatalf("recommendedHeader = %q, want Matching Model", got.sessionSelector.recommendedHeader)
+	}
+	if got.sessionSelector.otherHeader != "Other Sessions" {
+		t.Fatalf("otherHeader = %q, want Other Sessions", got.sessionSelector.otherHeader)
+	}
+	_ = cwd // used in session data
 }
 
 func TestCodexSessionPickerEnterSelectsSession(t *testing.T) {
