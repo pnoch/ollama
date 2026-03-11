@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/ollama/ollama/api"
@@ -147,6 +148,27 @@ type ResponsesFunctionCallOutput struct {
 
 func (ResponsesFunctionCallOutput) responsesInputItem() {}
 
+// ResponsesCustomToolCall represents a freeform/custom tool call in conversation history.
+type ResponsesCustomToolCall struct {
+	ID     string `json:"id,omitempty"`
+	Type   string `json:"type"` // always "custom_tool_call"
+	Status string `json:"status,omitempty"`
+	CallID string `json:"call_id"`
+	Name   string `json:"name"`
+	Input  string `json:"input"`
+}
+
+func (ResponsesCustomToolCall) responsesInputItem() {}
+
+// ResponsesCustomToolCallOutput represents a custom tool call result from the client.
+type ResponsesCustomToolCallOutput struct {
+	Type   string `json:"type"`    // always "custom_tool_call_output"
+	CallID string `json:"call_id"` // links to the original custom tool call
+	Output string `json:"output"`  // the tool result
+}
+
+func (ResponsesCustomToolCallOutput) responsesInputItem() {}
+
 // ResponsesReasoningInput represents a reasoning item passed back as input.
 // This is used when the client sends previous reasoning back for context.
 type ResponsesReasoningInput struct {
@@ -190,6 +212,18 @@ func unmarshalResponsesInputItem(data []byte) (ResponsesInputItem, error) {
 		return fc, nil
 	case "function_call_output":
 		var output ResponsesFunctionCallOutput
+		if err := json.Unmarshal(data, &output); err != nil {
+			return nil, err
+		}
+		return output, nil
+	case "custom_tool_call":
+		var custom ResponsesCustomToolCall
+		if err := json.Unmarshal(data, &custom); err != nil {
+			return nil, err
+		}
+		return custom, nil
+	case "custom_tool_call_output":
+		var output ResponsesCustomToolCallOutput
 		if err := json.Unmarshal(data, &output); err != nil {
 			return nil, err
 		}
@@ -399,6 +433,43 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 				Content:    v.Output,
 				ToolCallID: v.CallID,
 			})
+		case ResponsesCustomToolCall:
+			args, err := parseToolCallArguments(v.Input)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse custom tool call input: %w", err)
+			}
+			toolCall := api.ToolCall{
+				ID: v.CallID,
+				Function: api.ToolCallFunction{
+					Name:      v.Name,
+					Arguments: args,
+				},
+			}
+
+			if len(messages) > 0 && messages[len(messages)-1].Role == "assistant" {
+				lastMsg := &messages[len(messages)-1]
+				lastMsg.ToolCalls = append(lastMsg.ToolCalls, toolCall)
+				if pendingThinking != "" {
+					lastMsg.Thinking = pendingThinking
+					pendingThinking = ""
+				}
+			} else {
+				msg := api.Message{
+					Role:      "assistant",
+					ToolCalls: []api.ToolCall{toolCall},
+				}
+				if pendingThinking != "" {
+					msg.Thinking = pendingThinking
+					pendingThinking = ""
+				}
+				messages = append(messages, msg)
+			}
+		case ResponsesCustomToolCallOutput:
+			messages = append(messages, api.Message{
+				Role:       "tool",
+				Content:    v.Output,
+				ToolCallID: v.CallID,
+			})
 		}
 	}
 
@@ -460,6 +531,17 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 		Tools:    tools,
 		Format:   format,
 	}, nil
+}
+
+func parseToolCallArguments(input string) (api.ToolCallFunctionArguments, error) {
+	var args api.ToolCallFunctionArguments
+	if strings.TrimSpace(input) != "" && json.Unmarshal([]byte(input), &args) == nil {
+		return args, nil
+	}
+
+	args = api.NewToolCallFunctionArguments()
+	args.Set("input", input)
+	return args, nil
 }
 
 func convertTool(t ResponsesTool) (api.Tool, error) {

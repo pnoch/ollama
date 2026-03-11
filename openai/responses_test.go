@@ -226,6 +226,50 @@ func TestUnmarshalResponsesInputItem(t *testing.T) {
 		}
 	})
 
+	t.Run("custom_tool_call item", func(t *testing.T) {
+		got, err := unmarshalResponsesInputItem([]byte(`{"type":"custom_tool_call","call_id":"call_custom","name":"apply_patch","input":"*** Begin Patch"}`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		call, ok := got.(ResponsesCustomToolCall)
+		if !ok {
+			t.Fatalf("got type %T, want ResponsesCustomToolCall", got)
+		}
+
+		if call.Type != "custom_tool_call" {
+			t.Errorf("Type = %q, want %q", call.Type, "custom_tool_call")
+		}
+		if call.CallID != "call_custom" {
+			t.Errorf("CallID = %q, want %q", call.CallID, "call_custom")
+		}
+		if call.Name != "apply_patch" {
+			t.Errorf("Name = %q, want %q", call.Name, "apply_patch")
+		}
+	})
+
+	t.Run("custom_tool_call_output item", func(t *testing.T) {
+		got, err := unmarshalResponsesInputItem([]byte(`{"type":"custom_tool_call_output","call_id":"call_custom","output":"done"}`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		output, ok := got.(ResponsesCustomToolCallOutput)
+		if !ok {
+			t.Fatalf("got type %T, want ResponsesCustomToolCallOutput", got)
+		}
+
+		if output.Type != "custom_tool_call_output" {
+			t.Errorf("Type = %q, want %q", output.Type, "custom_tool_call_output")
+		}
+		if output.CallID != "call_custom" {
+			t.Errorf("CallID = %q, want %q", output.CallID, "call_custom")
+		}
+		if output.Output != "done" {
+			t.Errorf("Output = %q, want %q", output.Output, "done")
+		}
+	})
+
 	t.Run("unknown item type", func(t *testing.T) {
 		_, err := unmarshalResponsesInputItem([]byte(`{"type": "unknown_type"}`))
 		if err == nil {
@@ -453,6 +497,55 @@ func TestFromResponsesRequest_FunctionCallOutput(t *testing.T) {
 	}
 	if toolMsg.ToolCallID != "call_abc123" {
 		t.Errorf("expected ToolCallID 'call_abc123', got %q", toolMsg.ToolCallID)
+	}
+}
+
+func TestFromResponsesRequest_CustomToolCall(t *testing.T) {
+	reqJSON := `{
+		"model": "gpt-oss:20b",
+		"input": [
+			{"type": "custom_tool_call", "call_id": "call_patch", "name": "apply_patch", "input": "*** Begin Patch"},
+			{"type": "custom_tool_call_output", "call_id": "call_patch", "output": "Patch applied"}
+		]
+	}`
+
+	var req ResponsesRequest
+	if err := json.Unmarshal([]byte(reqJSON), &req); err != nil {
+		t.Fatalf("failed to unmarshal request: %v", err)
+	}
+
+	chatReq, err := FromResponsesRequest(req)
+	if err != nil {
+		t.Fatalf("failed to convert request: %v", err)
+	}
+
+	if len(chatReq.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(chatReq.Messages))
+	}
+
+	assistantMsg := chatReq.Messages[0]
+	if assistantMsg.Role != "assistant" {
+		t.Fatalf("expected role 'assistant', got %q", assistantMsg.Role)
+	}
+	if len(assistantMsg.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(assistantMsg.ToolCalls))
+	}
+	if assistantMsg.ToolCalls[0].Function.Name != "apply_patch" {
+		t.Fatalf("expected function name 'apply_patch', got %q", assistantMsg.ToolCalls[0].Function.Name)
+	}
+	if got, ok := assistantMsg.ToolCalls[0].Function.Arguments.Get("input"); !ok || got != "*** Begin Patch" {
+		t.Fatalf("expected wrapped raw input, got %#v (present=%v)", got, ok)
+	}
+
+	toolMsg := chatReq.Messages[1]
+	if toolMsg.Role != "tool" {
+		t.Fatalf("expected role 'tool', got %q", toolMsg.Role)
+	}
+	if toolMsg.ToolCallID != "call_patch" {
+		t.Fatalf("expected tool call id 'call_patch', got %q", toolMsg.ToolCallID)
+	}
+	if toolMsg.Content != "Patch applied" {
+		t.Fatalf("expected tool content 'Patch applied', got %q", toolMsg.Content)
 	}
 }
 
