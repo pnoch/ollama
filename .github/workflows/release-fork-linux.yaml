@@ -1,0 +1,59 @@
+name: release-fork-linux
+
+on:
+  push:
+    tags:
+      - 'pnoch-v*'
+
+jobs:
+  linux-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ github.ref_name }}
+      PLATFORM: linux/amd64,linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+
+      - name: Build Linux release bundles
+        run: |
+          export VERSION="${VERSION#pnoch-v}"
+          ./scripts/build_linux.sh
+
+      - name: Prepare installer
+        run: |
+          sed 's|https://ollama.com/download|https://github.com/pnoch/ollama/releases/latest/download|g' \
+            scripts/install.sh > dist/install.sh
+          chmod +x dist/install.sh
+
+      - name: Generate checksums
+        run: |
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort | xargs -I{} sh -c 'cd dist && sha256sum "{}"' > dist/sha256sum.txt
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}"
+          else
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+          fi
+
+      - name: Upload release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            dist/install.sh \
+            dist/sha256sum.txt \
+            dist/*.tar.zst \
+            --clobber
