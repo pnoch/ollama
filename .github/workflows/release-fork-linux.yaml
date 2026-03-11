@@ -1,9 +1,7 @@
 name: release-fork-linux
 
 on:
-  push:
-    tags:
-      - 'pnoch-v*'
+  workflow_dispatch:
 
 jobs:
   linux-build:
