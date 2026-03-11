@@ -31,6 +31,18 @@ require() {
     echo $MISSING
 }
 
+asset_exists() {
+    curl --fail --silent --head --location "$1" >/dev/null 2>&1
+}
+
+optional_bundle_exists() {
+    local url_base="$1"
+    local filename="$2"
+
+    asset_exists "${url_base}/${filename}.tar.zst${VER_PARAM}" || \
+        asset_exists "${url_base}/${filename}.tgz${VER_PARAM}"
+}
+
 OS="$(uname -s)"
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -185,9 +197,17 @@ fi
 # Check for NVIDIA JetPack systems with additional downloads
 if [ -f /etc/nv_tegra_release ] ; then
     if grep R36 /etc/nv_tegra_release > /dev/null ; then
-        download_and_extract "$DOWNLOAD_BASE_URL" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}-jetpack6"
+        if optional_bundle_exists "$DOWNLOAD_BASE_URL" "ollama-linux-${ARCH}-jetpack6"; then
+            download_and_extract "$DOWNLOAD_BASE_URL" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}-jetpack6"
+        else
+            warning "JetPack 6 bundle not available from $DOWNLOAD_BASE_URL. Continuing with base install."
+        fi
     elif grep R35 /etc/nv_tegra_release > /dev/null ; then
-        download_and_extract "$DOWNLOAD_BASE_URL" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}-jetpack5"
+        if optional_bundle_exists "$DOWNLOAD_BASE_URL" "ollama-linux-${ARCH}-jetpack5"; then
+            download_and_extract "$DOWNLOAD_BASE_URL" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}-jetpack5"
+        else
+            warning "JetPack 5 bundle not available from $DOWNLOAD_BASE_URL. Continuing with base install."
+        fi
     else
         warning "Unsupported JetPack version detected.  GPU may not be supported"
     fi
@@ -310,7 +330,11 @@ if ! check_gpu lspci nvidia && ! check_gpu lshw nvidia && ! check_gpu lspci amdg
 fi
 
 if check_gpu lspci amdgpu || check_gpu lshw amdgpu; then
-    download_and_extract "$DOWNLOAD_BASE_URL" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}-rocm"
+    if optional_bundle_exists "$DOWNLOAD_BASE_URL" "ollama-linux-${ARCH}-rocm"; then
+        download_and_extract "$DOWNLOAD_BASE_URL" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}-rocm"
+    else
+        warning "ROCm bundle not available from $DOWNLOAD_BASE_URL. Continuing with CPU-only install."
+    fi
 
     install_success
     status "AMD GPU ready."
