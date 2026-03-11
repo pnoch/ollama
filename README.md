@@ -32,6 +32,14 @@ or [download manually](https://ollama.com/download/OllamaSetup.exe)
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
+Fork release for `pnoch/ollama`:
+
+```shell
+curl -fsSL https://github.com/pnoch/ollama/releases/latest/download/install.sh | sh
+```
+
+[Fork releases](https://github.com/pnoch/ollama/releases)
+
 [Manual install instructions](https://docs.ollama.com/linux#manual-install)
 
 ### Docker
