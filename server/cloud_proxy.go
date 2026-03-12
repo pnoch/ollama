@@ -316,7 +316,7 @@ func normalizeCloudResponsesInput(raw json.RawMessage, model string) (json.RawMe
 		return nil, err
 	}
 
-	compacted, err := compactResponsesInput(normalizedJSON)
+	compacted, err := compactResponsesInputForModel(normalizedJSON, model)
 	if err != nil {
 		return nil, err
 	}

@@ -1353,6 +1353,79 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses model-aware compaction preserves larger recent tail", func(t *testing.T) {
+		makeInput := func() json.RawMessage {
+			input := []byte(`[
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"older 1"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older 2"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"older 3"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older 4"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"older 5"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older 6"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 1"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 2"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 3"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 4"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 5"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 6"}]}
+			]`)
+			return json.RawMessage(input)
+		}
+
+		largeOutput, err := compactResponsesInputForModel(makeInput(), "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		smallOutput, err := compactResponsesInputForModel(makeInput(), "gpt-oss:20b")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		largeJSON, err := json.Marshal(largeOutput)
+		if err != nil {
+			t.Fatal(err)
+		}
+		smallJSON, err := json.Marshal(smallOutput)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !bytes.Contains(largeJSON, []byte(`"text":"recent 2"`)) {
+			t.Fatalf("expected larger-context model compaction to preserve a larger recent tail, got %s", string(largeJSON))
+		}
+		if bytes.Contains(smallJSON, []byte(`"text":"recent 2"`)) {
+			t.Fatalf("expected smaller-context model compaction to preserve a smaller recent tail, got %s", string(smallJSON))
+		}
+	})
+
+	t.Run("v1 responses compaction preserves one older structured tool exchange", func(t *testing.T) {
+		raw := json.RawMessage(`[
+			{"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"query\":\"older docs\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"older result"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older explanation"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 1"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 2"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 3"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 4"}]}
+		]`)
+
+		output, err := compactResponsesInputForModel(raw, "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !bytes.Contains(body, []byte(`"type":"function_call"`)) || !bytes.Contains(body, []byte(`"type":"function_call_output"`)) {
+			t.Fatalf("expected one older tool exchange to remain as structured history, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`"text":"older explanation"`)) {
+			t.Fatalf("expected assistant explanation to remain represented after preserving structured tool exchange, got %s", string(body))
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
@@ -1553,8 +1626,11 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Contains(body, []byte(`Tool search({\"query\":\"archived\"})`)) || !bytes.Contains(body, []byte(`archived output`)) {
-			t.Fatalf("expected older tool exchange to be summarized as one line, got %s", string(body))
+		if !bytes.Contains(body, []byte(`"type":"function_call"`)) || !bytes.Contains(body, []byte(`"type":"function_call_output"`)) {
+			t.Fatalf("expected one older tool exchange to remain structured, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`archived output`)) {
+			t.Fatalf("expected preserved older tool output, got %s", string(body))
 		}
 	})
 
@@ -1835,8 +1911,11 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Contains(body, []byte(`Tool search({\"query\":\"release note\"}) -\u003e found release note | Assistant: The release note confirms the fix shipped.`)) {
-			t.Fatalf("expected older tool exchange and assistant follow-up to be summarized together, got %s", string(body))
+		if !bytes.Contains(body, []byte(`"type":"function_call"`)) || !bytes.Contains(body, []byte(`"type":"function_call_output"`)) {
+			t.Fatalf("expected one older tool exchange to remain structured, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`Assistant: The release note confirms the fix shipped.`)) {
+			t.Fatalf("expected assistant follow-up to remain represented after structured tool preservation, got %s", string(body))
 		}
 	})
 
