@@ -358,6 +358,7 @@ func buildCompactionSummary(parts []string, omittedCounts map[string]int) string
 	if len(parts) > 0 {
 		b.WriteString("Preserved summary:\n")
 		seen := make(map[string]struct{}, len(parts))
+		selected := make([]string, 0, len(parts))
 		for i := len(parts) - 1; i >= 0; i-- {
 			if b.Len() >= responsesCompactSummaryMaxChars {
 				break
@@ -367,8 +368,20 @@ func buildCompactionSummary(parts []string, omittedCounts map[string]int) string
 				continue
 			}
 			seen[part] = struct{}{}
+			selected = append(selected, part)
 			b.WriteString("- ")
 			b.WriteString(part)
+			b.WriteByte('\n')
+		}
+		b.Reset()
+		b.WriteString("Previous conversation history was compacted by Ollama.\n\n")
+		b.WriteString("Preserved summary:\n")
+		for i := len(selected) - 1; i >= 0; i-- {
+			if b.Len() >= responsesCompactSummaryMaxChars {
+				break
+			}
+			b.WriteString("- ")
+			b.WriteString(selected[i])
 			b.WriteByte('\n')
 		}
 	}
