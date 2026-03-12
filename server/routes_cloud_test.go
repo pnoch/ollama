@@ -1508,6 +1508,53 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses compact combines older tool exchange with assistant follow-up", func(t *testing.T) {
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{
+			"model":"minimax-m2.5:cloud",
+			"input":[
+				{"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"query\":\"release note\"}"},
+				{"type":"function_call_output","call_id":"call_1","output":"found release note"},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The release note confirms the fix shipped."}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"recent user"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent assistant"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"newest user"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"newest assistant"}]}
+			]
+		}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses/compact", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(body, []byte(`Tool search({\"query\":\"release note\"}) -\u003e found release note | Assistant: The release note confirms the fix shipped.`)) {
+			t.Fatalf("expected older tool exchange and assistant follow-up to be summarized together, got %s", string(body))
+		}
+	})
+
 	t.Run("v1 responses strips encrypted content from event stream", func(t *testing.T) {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
