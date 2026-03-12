@@ -864,6 +864,404 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses normalizes custom tool history for cloud upstream", func(t *testing.T) {
+		type upstreamCapture struct {
+			body []byte
+		}
+		capture := &upstreamCapture{}
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capture.body, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","model":"minimax-m2.5","output":[]}`))
+		}))
+		defer upstream.Close()
+
+		original := cloudProxyBaseURL
+		cloudProxyBaseURL = upstream.URL
+		t.Cleanup(func() { cloudProxyBaseURL = original })
+
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{
+			"model":"minimax-m2.5:cloud",
+			"input":[
+				{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch"},
+				{"type":"custom_tool_call_output","call_id":"call_patch","output":"Patch applied"}
+			],
+			"stream":false
+		}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if bytes.Contains(capture.body, []byte(`"type":"custom_tool_call"`)) {
+			t.Fatalf("expected custom_tool_call to be normalized, got %s", string(capture.body))
+		}
+		if bytes.Contains(capture.body, []byte(`"type":"custom_tool_call_output"`)) {
+			t.Fatalf("expected custom_tool_call_output to be normalized, got %s", string(capture.body))
+		}
+		if !bytes.Contains(capture.body, []byte(`"type":"function_call"`)) {
+			t.Fatalf("expected function_call in upstream body, got %s", string(capture.body))
+		}
+		if !bytes.Contains(capture.body, []byte(`"type":"function_call_output"`)) {
+			t.Fatalf("expected function_call_output in upstream body, got %s", string(capture.body))
+		}
+		if !bytes.Contains(capture.body, []byte(`"arguments":"{\"input\":\"*** Begin Patch\"}"`)) {
+			t.Fatalf("expected wrapped raw custom tool input, got %s", string(capture.body))
+		}
+	})
+
+	t.Run("v1 responses expands compaction history for cloud upstream", func(t *testing.T) {
+		var capture struct {
+			path string
+			body []byte
+		}
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capture.path = r.URL.Path
+			capture.body, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","model":"minimax-m2.5","output":[]}`)
+		}))
+		defer upstream.Close()
+
+		original := cloudProxyBaseURL
+		cloudProxyBaseURL = upstream.URL
+		t.Cleanup(func() { cloudProxyBaseURL = original })
+
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{
+			"model":"minimax-m2.5:cloud",
+			"input":[
+				{"type":"message","role":"user","content":"before"},
+				{"type":"compaction","message":"","replacement_history":[
+					{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]},
+					{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch"},
+					{"type":"custom_tool_call_output","call_id":"call_patch","output":"Patch applied"}
+				]},
+				{"type":"message","role":"user","content":"after"}
+			],
+			"stream":false
+		}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if capture.path != "/v1/responses" {
+			t.Fatalf("expected upstream path /v1/responses, got %q", capture.path)
+		}
+		if bytes.Contains(capture.body, []byte(`"type":"compaction"`)) {
+			t.Fatalf("expected compaction to be expanded, got %s", string(capture.body))
+		}
+		if !bytes.Contains(capture.body, []byte(`"text":"summary"`)) {
+			t.Fatalf("expected replacement history message in upstream body, got %s", string(capture.body))
+		}
+		if !bytes.Contains(capture.body, []byte(`"type":"function_call"`)) {
+			t.Fatalf("expected nested custom tool call to be normalized, got %s", string(capture.body))
+		}
+		if !bytes.Contains(capture.body, []byte(`"type":"function_call_output"`)) {
+			t.Fatalf("expected nested custom tool output to be normalized, got %s", string(capture.body))
+		}
+		if !bytes.Contains(capture.body, []byte(`"content":"before"`)) || !bytes.Contains(capture.body, []byte(`"content":"after"`)) {
+			t.Fatalf("expected surrounding history to be preserved, got %s", string(capture.body))
+		}
+	})
+
+	t.Run("v1 responses drops web search call history for cloud upstream", func(t *testing.T) {
+		var capture struct {
+			path string
+			body []byte
+		}
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capture.path = r.URL.Path
+			capture.body, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","model":"minimax-m2.5","output":[]}`)
+		}))
+		defer upstream.Close()
+
+		original := cloudProxyBaseURL
+		cloudProxyBaseURL = upstream.URL
+		t.Cleanup(func() { cloudProxyBaseURL = original })
+
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{
+			"model":"minimax-m2.5:cloud",
+			"input":[
+				{"type":"message","role":"user","content":"before"},
+				{"type":"web_search_call","status":"completed","action":{"type":"search","query":"hello"}},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"after"}]}
+			],
+			"stream":false
+		}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if capture.path != "/v1/responses" {
+			t.Fatalf("expected upstream path /v1/responses, got %q", capture.path)
+		}
+		if bytes.Contains(capture.body, []byte(`"type":"web_search_call"`)) {
+			t.Fatalf("expected web_search_call to be dropped, got %s", string(capture.body))
+		}
+		if !bytes.Contains(capture.body, []byte(`"content":"before"`)) || !bytes.Contains(capture.body, []byte(`"text":"after"`)) {
+			t.Fatalf("expected surrounding history to be preserved, got %s", string(capture.body))
+		}
+	})
+
+	t.Run("v1 responses compacts oversized normalized history before cloud upstream", func(t *testing.T) {
+		var capture struct {
+			path string
+			body []byte
+		}
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capture.path = r.URL.Path
+			capture.body, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","model":"minimax-m2.5","output":[]}`)
+		}))
+		defer upstream.Close()
+
+		original := cloudProxyBaseURL
+		cloudProxyBaseURL = upstream.URL
+		t.Cleanup(func() { cloudProxyBaseURL = original })
+
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		var b strings.Builder
+		b.WriteString(`{"model":"minimax-m2.5:cloud","input":[`)
+		for i := 0; i < 32; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(`{"type":"message","role":"user","content":[{"type":"input_text","text":"`)
+			b.WriteString(strings.Repeat("very long message ", 80))
+			b.WriteString(`"}]}`)
+		}
+		b.WriteString(`],"stream":false}`)
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses", bytes.NewBufferString(b.String()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if capture.path != "/v1/responses" {
+			t.Fatalf("expected upstream path /v1/responses, got %q", capture.path)
+		}
+		if len(capture.body) >= cloudResponsesInputCompactMax {
+			t.Fatalf("expected compacted upstream body smaller than threshold, got %d bytes", len(capture.body))
+		}
+		if bytes.Count(capture.body, []byte(`"role":"user"`)) > responsesCompactKeepRecentUserMessages {
+			t.Fatalf("expected only recent user messages to remain, got %s", string(capture.body))
+		}
+		if !bytes.Contains(capture.body, []byte(`Previous conversation history was compacted by Ollama.`)) {
+			t.Fatalf("expected synthetic compacted summary, got %s", string(capture.body))
+		}
+	})
+
+	t.Run("v1 responses compact returns input-compatible output", func(t *testing.T) {
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := []byte(`{
+			"model":"minimax-m2.5:cloud",
+			"input":[
+				{"type":"message","role":"system","content":[{"type":"input_text","text":"system rules"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"keep this request"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"previous assistant answer"}]},
+				{"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"query\":\"docs\"}"},
+				{"type":"function_call_output","call_id":"call_1","output":"search result payload"}
+			]
+		}`)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses/compact", bytes.NewReader(zstdCompress(t, reqBody)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Encoding", "zstd")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+
+		var payload struct {
+			Object string `json:"object"`
+			Model  string `json:"model"`
+			Output []struct {
+				Type    string `json:"type"`
+				Role    string `json:"role"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"output"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Object != "response.compaction" {
+			t.Fatalf("expected response.compaction object, got %q", payload.Object)
+		}
+		if payload.Model != "minimax-m2.5:cloud" {
+			t.Fatalf("expected aliased model in response, got %q", payload.Model)
+		}
+		if len(payload.Output) < 2 {
+			t.Fatalf("expected preserved history plus summary, got %+v", payload.Output)
+		}
+		if payload.Output[0].Role != "system" || payload.Output[1].Role != "user" {
+			t.Fatalf("expected preserved system and user messages, got %+v", payload.Output)
+		}
+		last := payload.Output[len(payload.Output)-1]
+		if last.Role != "assistant" || len(last.Content) == 0 {
+			t.Fatalf("expected assistant summary message, got %+v", last)
+		}
+		if !strings.Contains(last.Content[0].Text, "previous assistant answer") {
+			t.Fatalf("expected summary to include assistant history, got %q", last.Content[0].Text)
+		}
+		if !strings.Contains(last.Content[0].Text, "search result payload") {
+			t.Fatalf("expected summary to include tool output, got %q", last.Content[0].Text)
+		}
+	})
+
+	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{
+			"model":"minimax-m2.5:cloud",
+			"input":[
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"u1"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"u2"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"u3"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"u4"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"u5"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"u6"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"u7"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant context"}]}
+			]
+		}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses/compact", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(body, []byte(`"text":"u1"`)) {
+			t.Fatalf("expected oldest user message to be compacted, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`"text":"u7"`)) {
+			t.Fatalf("expected newest user message to remain, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`user: u1`)) {
+			t.Fatalf("expected dropped user message to appear in summary, got %s", string(body))
+		}
+	})
+
 	t.Run("v1 responses strips encrypted content from event stream", func(t *testing.T) {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
