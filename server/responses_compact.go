@@ -445,6 +445,10 @@ func summarizeCompactedSameRoleMessageRun(items []map[string]any, index int) (su
 		if nextText == "" {
 			break
 		}
+		if nextText == lines[len(lines)-1] {
+			last = j
+			continue
+		}
 		if len(strings.Join(append(append([]string{}, lines...), nextText), " / ")) > responsesCompactSameRoleRunMaxChars {
 			break
 		}
