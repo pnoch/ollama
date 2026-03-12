@@ -15,6 +15,7 @@ Examples:
 Environment overrides:
   PLATFORM=linux/amd64,linux/arm64
   OLLAMA_DOWNLOAD_URL=https://github.com/pnoch/ollama/releases/latest/download
+  UPLOAD_CHECKSUMS=1
 EOF
 }
 
@@ -29,6 +30,7 @@ VERSION="${TAG#pnoch-v}"
 ROOT_DIR="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 DOWNLOAD_URL="${OLLAMA_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"
+UPLOAD_CHECKSUMS="${UPLOAD_CHECKSUMS:-0}"
 
 require() {
     missing=""
@@ -76,8 +78,16 @@ fi
 echo "Uploading artifacts"
 gh release upload "$TAG" --repo "$REPO" \
     "$DIST_DIR/install.sh" \
-    "$DIST_DIR/sha256sum.txt" \
     "$DIST_DIR"/*.tar.zst \
     --clobber
+
+if [ "$UPLOAD_CHECKSUMS" = "1" ]; then
+    echo "Uploading checksum file"
+    gh release upload "$TAG" --repo "$REPO" \
+        "$DIST_DIR/sha256sum.txt" \
+        --clobber
+else
+    echo "Skipping checksum upload; merge and upload sha256sum.txt separately when combining artifacts."
+fi
 
 echo "Release updated: https://github.com/$REPO/releases/tag/$TAG"

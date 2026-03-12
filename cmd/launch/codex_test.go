@@ -132,8 +132,8 @@ func TestCodexModelCatalogArg(t *testing.T) {
 	if entry["context_window"] != float64(204800) {
 		t.Fatalf("entry context_window = %v, want 204800", entry["context_window"])
 	}
-	if entry["auto_compact_token_limit"] != float64(194560) {
-		t.Fatalf("entry auto_compact_token_limit = %v, want 194560", entry["auto_compact_token_limit"])
+	if _, ok := entry["auto_compact_token_limit"]; ok {
+		t.Fatalf("entry auto_compact_token_limit = %v, want omitted", entry["auto_compact_token_limit"])
 	}
 	if entry["prefer_websockets"] != false {
 		t.Fatalf("entry prefer_websockets = %v, want false", entry["prefer_websockets"])
