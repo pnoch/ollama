@@ -374,6 +374,30 @@ type structuredCompactionCandidate struct {
 	recency    int
 }
 
+func scoreStructuredCompactionCandidate(structured []map[string]any, bonuses ...int) int {
+	score := len(structured) * 10
+	for _, item := range structured {
+		switch normalizeResponsesItemType(item) {
+		case "function_call", "custom_tool_call":
+			score += 6
+		case "function_call_output", "custom_tool_call_output":
+			score += 5
+		case "message":
+			role, _ := item["role"].(string)
+			switch role {
+			case "user":
+				score += 7
+			case "assistant":
+				score += 6
+			}
+		}
+	}
+	for _, bonus := range bonuses {
+		score += bonus
+	}
+	return score
+}
+
 func selectStructuredCompactionCandidate(compactedHead, preservedTail []map[string]any, model string) (structuredCompactionCandidate, bool) {
 	best := structuredCompactionCandidate{}
 	found := false
@@ -423,7 +447,7 @@ func candidateStructuredToolExchange(items []map[string]any, index int) (structu
 		structured: structured,
 		headStart:  index,
 		headEnd:    nextIndex,
-		score:      30,
+		score:      scoreStructuredCompactionCandidate(structured),
 		recency:    index,
 	}, true
 }
@@ -461,7 +485,7 @@ func candidateStructuredToolExchangeWithAssistant(items []map[string]any, index 
 		structured: structured,
 		headStart:  index,
 		headEnd:    nextIndex,
-		score:      50,
+		score:      scoreStructuredCompactionCandidate(structured, 3),
 		recency:    index,
 	}, true
 }
@@ -500,7 +524,7 @@ func candidateStructuredUserToolRun(items []map[string]any, index int, model str
 		structured: structured,
 		headStart:  index,
 		headEnd:    nextIndex,
-		score:      70,
+		score:      scoreStructuredCompactionCandidate(structured, 8),
 		recency:    index,
 	}, true
 }
@@ -514,7 +538,7 @@ func candidateStructuredMessagePair(items []map[string]any, index int, model str
 		structured: structured,
 		headStart:  index,
 		headEnd:    nextIndex,
-		score:      40,
+		score:      scoreStructuredCompactionCandidate(structured),
 		recency:    index,
 	}, true
 }
@@ -571,7 +595,7 @@ func candidateBoundaryMessagePair(compactedHead, preservedTail []map[string]any,
 		headStart:  len(compactedHead) - 1,
 		headEnd:    len(compactedHead) - 1,
 		tailDrop:   1,
-		score:      45,
+		score:      scoreStructuredCompactionCandidate([]map[string]any{lastHead, firstTail}, 1),
 		recency:    len(compactedHead) - 1,
 	}, true
 }
@@ -600,7 +624,7 @@ func candidateBoundaryUserToolRun(compactedHead, preservedTail []map[string]any,
 		headStart:  len(compactedHead) - 1,
 		headEnd:    len(compactedHead) - 1,
 		tailDrop:   nextIndex + 1,
-		score:      75,
+		score:      scoreStructuredCompactionCandidate(append([]map[string]any{lastHead}, triple...), 6),
 		recency:    len(compactedHead) - 1,
 	}, true
 }
@@ -638,7 +662,7 @@ func candidateBoundaryUserToolAssistantRun(compactedHead, preservedTail []map[st
 		headStart:  len(compactedHead) - 3,
 		headEnd:    len(compactedHead) - 1,
 		tailDrop:   1,
-		score:      80,
+		score:      scoreStructuredCompactionCandidate(append([]map[string]any{user}, append(pair, firstTail)...), 7),
 		recency:    len(compactedHead) - 1,
 	}, true
 }

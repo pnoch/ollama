@@ -1545,7 +1545,7 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 			{"type": "function_call_output", "call_id": "call_2", "output": "newer output"},
 		}
 
-		candidate, ok := selectStructuredCompactionCandidate(compactedHead, nil, "gpt-oss:20b")
+		candidate, ok := selectStructuredCompactionCandidate(compactedHead, nil, "minimax-m2.5")
 		if !ok {
 			t.Fatal("expected candidate")
 		}
@@ -1555,6 +1555,29 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 		if !bytes.Contains(body, []byte(`newer output`)) {
 			t.Fatalf("expected more recent equal-score tool chunk to win, got %s", string(body))
+		}
+	})
+
+	t.Run("v1 responses structured candidate scoring prefers richer chunk over bare pair", func(t *testing.T) {
+		compactedHead := []map[string]any{
+			{"type": "function_call", "call_id": "call_1", "name": "search", "arguments": "{\"query\":\"pair\"}"},
+			{"type": "function_call_output", "call_id": "call_1", "output": "pair output"},
+			{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "richer question"}}},
+			{"type": "function_call", "call_id": "call_2", "name": "search", "arguments": "{\"query\":\"richer\"}"},
+			{"type": "function_call_output", "call_id": "call_2", "output": "richer output"},
+			{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "richer explanation"}}},
+		}
+
+		candidate, ok := selectStructuredCompactionCandidate(compactedHead, nil, "minimax-m2.5")
+		if !ok {
+			t.Fatal("expected candidate")
+		}
+		body, err := json.Marshal(candidate.structured)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(body, []byte(`richer explanation`)) {
+			t.Fatalf("expected richer structured chunk to beat bare tool pair, got %s", string(body))
 		}
 	})
 
