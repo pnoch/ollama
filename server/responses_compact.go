@@ -946,27 +946,72 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 		return nil
 	}
 
+	type summaryCandidate struct {
+		text    string
+		index   int
+		score   int
+		lineLen int
+	}
+
 	seen := make(map[string]struct{}, len(parts))
-	selected := make([]string, 0, len(parts))
-	used := 0
-	for i := len(parts) - 1; i >= 0; i-- {
-		part := compactSnippet(parts[i])
+	candidates := make([]summaryCandidate, 0, len(parts))
+	for i, raw := range parts {
+		part := compactSnippet(raw)
 		if part == "" {
 			continue
 		}
 		if _, ok := seen[part]; ok {
 			continue
 		}
-		lineLen := len("- ") + len(part) + 1
-		if used+lineLen > budget {
+		seen[part] = struct{}{}
+		candidates = append(candidates, summaryCandidate{
+			text:    part,
+			index:   i,
+			score:   scoreCompactionSummaryPart(part),
+			lineLen: len("- ") + len(part) + 1,
+		})
+	}
+	slices.SortFunc(candidates, func(a, b summaryCandidate) int {
+		if a.score != b.score {
+			if a.score > b.score {
+				return -1
+			}
+			return 1
+		}
+		if a.index != b.index {
+			if a.index > b.index {
+				return -1
+			}
+			return 1
+		}
+		return 0
+	})
+
+	selected := make([]summaryCandidate, 0, len(candidates))
+	used := 0
+	for _, candidate := range candidates {
+		if used+candidate.lineLen > budget {
 			continue
 		}
-		seen[part] = struct{}{}
-		selected = append(selected, part)
-		used += lineLen
+		selected = append(selected, candidate)
+		used += candidate.lineLen
 	}
-	slices.Reverse(selected)
-	return selected
+
+	slices.SortFunc(selected, func(a, b summaryCandidate) int {
+		if a.index < b.index {
+			return -1
+		}
+		if a.index > b.index {
+			return 1
+		}
+		return 0
+	})
+
+	output := make([]string, 0, len(selected))
+	for _, candidate := range selected {
+		output = append(output, candidate.text)
+	}
+	return output
 }
 
 func buildCompactionOmittedCountsSection(omittedCounts map[string]int) string {
@@ -985,6 +1030,26 @@ func buildCompactionOmittedCountsSection(omittedCounts map[string]int) string {
 		b.WriteString(fmt.Sprintf(" %s=%d", key, omittedCounts[key]))
 	}
 	return b.String()
+}
+
+func scoreCompactionSummaryPart(part string) int {
+	score := 0
+	switch {
+	case strings.Contains(part, " | Tool ") && strings.Contains(part, " | Assistant:"):
+		score += 60
+	case strings.Contains(part, "Tool ") && strings.Contains(part, "->"):
+		score += 45
+	case strings.Contains(part, "User:") && strings.Contains(part, "Assistant:"):
+		score += 35
+	case strings.Contains(part, "Assistant:"):
+		score += 20
+	case strings.Contains(part, "User:"):
+		score += 18
+	case strings.Contains(part, "Tool call ") || strings.Contains(part, "Tool output:"):
+		score += 15
+	}
+	score += min(len(part)/24, 10)
+	return score
 }
 
 func compactSnippet(text string) string {
