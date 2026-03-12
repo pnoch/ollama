@@ -1796,6 +1796,21 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses summary selector prefers denser lines under budget", func(t *testing.T) {
+		concise := "Tool search({\"query\":\"fix\"}) -> shipped"
+		verbose := "Tool search({\"query\":\"very long release investigation query\"}) -> shipped after extensive investigation across many release notes and follow-up validation steps"
+		assistant := "Assistant: confirmed"
+
+		budget := len("- ") + len(compactSnippet(concise)) + 1 + len("- ") + len(compactSnippet(assistant)) + 1
+		selected := selectCompactionSummaryParts([]string{verbose, concise, assistant}, budget)
+		if len(selected) != 2 {
+			t.Fatalf("expected two selected summary parts, got %+v", selected)
+		}
+		if selected[0] != compactSnippet(concise) || selected[1] != compactSnippet(assistant) {
+			t.Fatalf("expected denser rich line to beat verbose alternative, got %+v", selected)
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
