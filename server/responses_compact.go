@@ -954,24 +954,30 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 		lineLen int
 	}
 
-	seen := make(map[string]struct{}, len(parts))
-	candidates := make([]summaryCandidate, 0, len(parts))
+	candidateByKey := make(map[string]summaryCandidate, len(parts))
 	for i, raw := range parts {
 		part := compactSnippet(raw)
 		if part == "" {
 			continue
 		}
-		if _, ok := seen[part]; ok {
-			continue
-		}
-		seen[part] = struct{}{}
-		candidates = append(candidates, summaryCandidate{
+		key := normalizeCompactionSummaryPart(part)
+		candidate := summaryCandidate{
 			text:    part,
 			index:   i,
 			score:   scoreCompactionSummaryPart(part),
 			kind:    classifyCompactionSummaryPart(part),
 			lineLen: len("- ") + len(part) + 1,
-		})
+		}
+		if existing, ok := candidateByKey[key]; ok {
+			if existing.score > candidate.score || (existing.score == candidate.score && existing.index > candidate.index) {
+				continue
+			}
+		}
+		candidateByKey[key] = candidate
+	}
+	candidates := make([]summaryCandidate, 0, len(candidateByKey))
+	for _, candidate := range candidateByKey {
+		candidates = append(candidates, candidate)
 	}
 	slices.SortFunc(candidates, func(a, b summaryCandidate) int {
 		if a.score != b.score {
@@ -1103,6 +1109,26 @@ func compactionSummaryKindPenalty(kind string) int {
 	default:
 		return 10
 	}
+}
+
+func normalizeCompactionSummaryPart(part string) string {
+	part = strings.TrimSpace(part)
+	prefixes := []string{
+		"Assistant:",
+		"User:",
+		"Tool output:",
+		"Tool call:",
+		"Web search:",
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(part, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(part, prefix))
+		}
+	}
+	if strings.HasPrefix(part, "Tool ") {
+		return strings.TrimSpace(strings.TrimPrefix(part, "Tool "))
+	}
+	return part
 }
 
 func compactSnippet(text string) string {

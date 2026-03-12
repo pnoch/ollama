@@ -1782,6 +1782,20 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses summary selector dedupes near-duplicates across categories", func(t *testing.T) {
+		assistant := "Assistant: fix shipped in 0.17.7"
+		user := "User: fix shipped in 0.17.7"
+		tool := "Tool search({\"query\":\"release note\"}) -> fix shipped in 0.17.7"
+
+		selected := selectCompactionSummaryParts([]string{user, assistant, tool}, 1000)
+		if len(selected) != 2 {
+			t.Fatalf("expected one near-duplicate to be removed, got %+v", selected)
+		}
+		if selected[0] != compactSnippet(assistant) || selected[1] != compactSnippet(tool) {
+			t.Fatalf("expected stronger near-duplicate variants to survive, got %+v", selected)
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
