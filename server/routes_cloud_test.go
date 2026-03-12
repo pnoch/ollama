@@ -1537,6 +1537,27 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses structured candidate selection prefers more recent equal-score chunk", func(t *testing.T) {
+		compactedHead := []map[string]any{
+			{"type": "function_call", "call_id": "call_1", "name": "search", "arguments": "{\"query\":\"older\"}"},
+			{"type": "function_call_output", "call_id": "call_1", "output": "older output"},
+			{"type": "function_call", "call_id": "call_2", "name": "search", "arguments": "{\"query\":\"newer\"}"},
+			{"type": "function_call_output", "call_id": "call_2", "output": "newer output"},
+		}
+
+		candidate, ok := selectStructuredCompactionCandidate(compactedHead, nil, "gpt-oss:20b")
+		if !ok {
+			t.Fatal("expected candidate")
+		}
+		body, err := json.Marshal(candidate.structured)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(body, []byte(`newer output`)) {
+			t.Fatalf("expected more recent equal-score tool chunk to win, got %s", string(body))
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
