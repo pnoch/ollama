@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -19,6 +20,8 @@ const (
 	responsesCompactSameRoleRunMaxItems = 3
 	responsesCompactSameRoleRunMaxChars = 180
 )
+
+var referentialListLinePattern = regexp.MustCompile(`(?m)^\s*(?:[-*]|\d+[.)])\s+\S+`)
 
 func (s *Server) ResponsesCompactHandler(c *gin.Context) {
 	body, err := readRequestBody(c.Request)
@@ -224,7 +227,9 @@ func splitCompactedTailWithBudget(items []map[string]any, chunkMax, charMax int)
 		startItem += len(chunks[i])
 	}
 
-	return items[startItem:], items[:startItem]
+	preservedTail = items[startItem:]
+	compactedHead = items[:startItem]
+	return preserveLatestAssistantReferentialAnchor(compactedHead, preservedTail)
 }
 
 func responsesCompactTailBudget(model string) (chunkMax, charMax int) {
@@ -270,6 +275,35 @@ func shouldSkipStructuredPreservedItem(structuredPreserved, preservedTail []map[
 		}
 	}
 	return false
+}
+
+func preserveLatestAssistantReferentialAnchor(compactedHead, preservedTail []map[string]any) ([]map[string]any, []map[string]any) {
+	for i := len(compactedHead) - 1; i >= 0; i-- {
+		if !isAssistantReferentialAnchorMessage(compactedHead[i]) {
+			continue
+		}
+		item := compactedHead[i]
+		newHead := append([]map[string]any{}, compactedHead[:i]...)
+		newHead = append(newHead, compactedHead[i+1:]...)
+		newTail := append([]map[string]any{item}, preservedTail...)
+		return newTail, newHead
+	}
+	return preservedTail, compactedHead
+}
+
+func isAssistantReferentialAnchorMessage(item map[string]any) bool {
+	if normalizeResponsesItemType(item) != "message" {
+		return false
+	}
+	role, _ := item["role"].(string)
+	if role != "assistant" {
+		return false
+	}
+	text := extractResponsesItemRawText(item["content"])
+	if text == "" {
+		return false
+	}
+	return len(referentialListLinePattern.FindAllString(text, -1)) >= 2
 }
 
 func buildResponsesCompactionChunks(items []map[string]any) [][]map[string]any {
@@ -1199,9 +1233,17 @@ func compactSnippet(text string) string {
 }
 
 func extractResponsesItemText(content any) string {
+	raw := extractResponsesItemRawText(content)
+	if raw == "" {
+		return ""
+	}
+	return compactSnippet(raw)
+}
+
+func extractResponsesItemRawText(content any) string {
 	switch typed := content.(type) {
 	case string:
-		return compactSnippet(typed)
+		return strings.TrimSpace(typed)
 	case []any:
 		parts := make([]string, 0, len(typed))
 		for _, raw := range typed {
@@ -1209,7 +1251,7 @@ func extractResponsesItemText(content any) string {
 			if item == nil {
 				continue
 			}
-			text := compactSnippet(stringValue(item["text"]))
+			text := strings.TrimSpace(stringValue(item["text"]))
 			if text != "" {
 				parts = append(parts, text)
 			}
