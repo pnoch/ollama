@@ -98,6 +98,11 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 	for i := 0; i < len(compactedHead); i++ {
 		item := compactedHead[i]
 		itemType := normalizeResponsesItemType(item)
+		if combined, nextIndex, ok := summarizeCompactedSameRoleMessageRun(compactedHead, i); ok {
+			summaryParts = append(summaryParts, combined)
+			i = nextIndex
+			continue
+		}
 		if combined, nextIndex, ok := summarizeCompactedMessageRun(compactedHead, i); ok {
 			summaryParts = append(summaryParts, combined)
 			i = nextIndex
@@ -345,6 +350,49 @@ func roleLabel(role string) string {
 	default:
 		return role
 	}
+}
+
+func summarizeCompactedSameRoleMessageRun(items []map[string]any, index int) (summary string, nextIndex int, ok bool) {
+	item := items[index]
+	if normalizeResponsesItemType(item) != "message" {
+		return "", index, false
+	}
+
+	role, _ := item["role"].(string)
+	if role != "user" && role != "assistant" {
+		return "", index, false
+	}
+
+	lines := make([]string, 0, 2)
+	text := extractResponsesItemText(item["content"])
+	if text == "" {
+		return "", index, false
+	}
+	lines = append(lines, text)
+	last := index
+
+	for j := index + 1; j < len(items) && len(lines) < 2; j++ {
+		next := items[j]
+		if normalizeResponsesItemType(next) != "message" {
+			break
+		}
+		nextRole, _ := next["role"].(string)
+		if nextRole != role {
+			break
+		}
+		nextText := extractResponsesItemText(next["content"])
+		if nextText == "" {
+			break
+		}
+		lines = append(lines, nextText)
+		last = j
+	}
+
+	if len(lines) < 2 {
+		return "", index, false
+	}
+
+	return fmt.Sprintf("%s: %s", roleLabel(role), strings.Join(lines, " / ")), last, true
 }
 
 func buildCompactionSummary(parts []string, omittedCounts map[string]int) string {
