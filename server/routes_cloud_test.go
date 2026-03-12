@@ -1124,11 +1124,11 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if len(capture.body) >= cloudResponsesInputCompactMax {
 			t.Fatalf("expected compacted upstream body smaller than threshold, got %d bytes", len(capture.body))
 		}
-		if bytes.Count(capture.body, []byte(`"type":"message"`)) > responsesCompactRecentTailMaxItems+1 {
-			t.Fatalf("expected compacted upstream body to preserve only a small recent tail plus summary, got %s", string(capture.body))
-		}
 		if !bytes.Contains(capture.body, []byte(`Previous conversation history was compacted by Ollama.`)) {
 			t.Fatalf("expected synthetic compacted summary, got %s", string(capture.body))
+		}
+		if bytes.Count(capture.body, []byte(`"type":"function_call"`)) > 1 || bytes.Count(capture.body, []byte(`"type":"function_call_output"`)) > 1 {
+			t.Fatalf("expected at most one recent tool exchange to remain, got %s", string(capture.body))
 		}
 	})
 
@@ -1305,14 +1305,20 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Contains(body, []byte(`"text":"older assistant"`)) || !bytes.Contains(body, []byte(`"text":"latest assistant"`)) {
-			t.Fatalf("expected recent assistant tail to remain, got %s", string(body))
+		if !bytes.Contains(body, []byte(`"text":"latest assistant"`)) {
+			t.Fatalf("expected latest assistant message to remain, got %s", string(body))
 		}
 		if bytes.Contains(body, []byte(`"text":"oldest assistant"`)) {
 			t.Fatalf("expected oldest assistant message to be compacted, got %s", string(body))
 		}
+		if bytes.Contains(body, []byte(`"text":"older assistant"`)) {
+			t.Fatalf("expected older assistant message to be compacted once tail budget is exceeded, got %s", string(body))
+		}
 		if !bytes.Contains(body, []byte(`Assistant: oldest assistant`)) {
 			t.Fatalf("expected oldest assistant message in summary, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`Assistant: older assistant`)) {
+			t.Fatalf("expected older assistant message in summary, got %s", string(body))
 		}
 	})
 
