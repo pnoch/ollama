@@ -1581,6 +1581,45 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses compaction preserves two structured chunks for larger models", func(t *testing.T) {
+		raw := json.RawMessage(`[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"older question"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older answer"}]},
+			{"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"query\":\"older docs\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"older result"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older explanation"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 1"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 2"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 3"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 4"}]}
+		]`)
+
+		largeOutput, err := compactResponsesInputForModel(raw, "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		smallOutput, err := compactResponsesInputForModel(raw, "gpt-oss:20b")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		largeJSON, err := json.Marshal(largeOutput)
+		if err != nil {
+			t.Fatal(err)
+		}
+		smallJSON, err := json.Marshal(smallOutput)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !bytes.Contains(largeJSON, []byte(`"text":"older answer"`)) || !bytes.Contains(largeJSON, []byte(`"type":"function_call"`)) {
+			t.Fatalf("expected larger-context model to preserve two structured chunks, got %s", string(largeJSON))
+		}
+		if bytes.Contains(smallJSON, []byte(`"text":"older answer"`)) && bytes.Contains(smallJSON, []byte(`"type":"function_call"`)) {
+			t.Fatalf("expected smaller-context model to preserve fewer structured chunks, got %s", string(smallJSON))
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
