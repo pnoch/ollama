@@ -1766,6 +1766,22 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses summary selector penalizes repeated low-value kinds more", func(t *testing.T) {
+		assistant1 := "Assistant: short note one"
+		assistant2 := "Assistant: short note two"
+		tool1 := "Tool search({\"query\":\"first\"}) -> first result"
+		tool2 := "Tool search({\"query\":\"second\"}) -> second result"
+
+		budget := len("- ") + len(compactSnippet(tool1)) + 1 + len("- ") + len(compactSnippet(tool2)) + 1 + len("- ") + len(compactSnippet(assistant2)) + 1
+		selected := selectCompactionSummaryParts([]string{assistant1, tool1, assistant2, tool2}, budget)
+		if len(selected) != 3 {
+			t.Fatalf("expected three selected summary parts, got %+v", selected)
+		}
+		if selected[0] != compactSnippet(tool1) || selected[1] != compactSnippet(assistant2) || selected[2] != compactSnippet(tool2) {
+			t.Fatalf("expected repeated tool exchanges to survive more easily than repeated assistant lines, got %+v", selected)
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)

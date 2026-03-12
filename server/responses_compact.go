@@ -1000,7 +1000,7 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 			if used+candidate.lineLen > budget {
 				continue
 			}
-			effective := candidate.score - selectedKinds[candidate.kind]*12
+			effective := candidate.score - selectedKinds[candidate.kind]*compactionSummaryKindPenalty(candidate.kind)
 			if bestIndex == -1 || effective > bestEffective || (effective == bestEffective && candidate.index > remaining[bestIndex].index) {
 				bestIndex = i
 				bestEffective = effective
@@ -1087,6 +1087,21 @@ func classifyCompactionSummaryPart(part string) string {
 		return "tool"
 	default:
 		return "other"
+	}
+}
+
+func compactionSummaryKindPenalty(kind string) int {
+	switch kind {
+	case "user_tool_assistant":
+		return 6
+	case "tool_exchange", "message_pair":
+		return 8
+	case "assistant", "user":
+		return 12
+	case "tool":
+		return 14
+	default:
+		return 10
 	}
 }
 
