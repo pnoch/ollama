@@ -1839,6 +1839,20 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses summary selector ignores quote and whitespace-only differences", func(t *testing.T) {
+		curly := "Assistant: “fix   shipped” in 0.17.7"
+		plain := "Assistant: \"fix shipped\" in 0.17.7"
+		tool := "Tool search({\"query\":\"release note\"}) -> \"fix shipped\" in 0.17.7"
+
+		selected := selectCompactionSummaryParts([]string{curly, plain, tool}, 1000)
+		if len(selected) != 2 {
+			t.Fatalf("expected quote/whitespace variant to be deduped, got %+v", selected)
+		}
+		if selected[0] != compactSnippet(plain) || selected[1] != compactSnippet(tool) {
+			t.Fatalf("expected normalized quote/whitespace variants to survive, got %+v", selected)
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
