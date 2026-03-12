@@ -1652,6 +1652,32 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses skips duplicate preserved assistant text", func(t *testing.T) {
+		raw := json.RawMessage(`[
+			{"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"query\":\"older docs\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"older result"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"shared assistant text"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"shared assistant text"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 1"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 2"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 3"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 4"}]}
+		]`)
+
+		output, err := compactResponsesInputForModel(raw, "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if bytes.Count(body, []byte(`shared assistant text`)) != 1 {
+			t.Fatalf("expected duplicate preserved assistant text to be collapsed, got %s", string(body))
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)

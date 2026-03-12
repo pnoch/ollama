@@ -169,7 +169,12 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 		})
 		structuredPreserved := make([]map[string]any, 0, 8)
 		for _, selection := range structuredSelections {
-			structuredPreserved = append(structuredPreserved, selection.structured...)
+			for _, item := range selection.structured {
+				if shouldSkipStructuredPreservedItem(structuredPreserved, preservedTail, item) {
+					continue
+				}
+				structuredPreserved = append(structuredPreserved, item)
+			}
 		}
 		output = append(output, structuredPreserved...)
 	}
@@ -236,6 +241,35 @@ func responsesStructuredChunkBudget(model string) int {
 		return 2
 	}
 	return 1
+}
+
+func shouldSkipStructuredPreservedItem(structuredPreserved, preservedTail []map[string]any, item map[string]any) bool {
+	if normalizeResponsesItemType(item) != "message" {
+		return false
+	}
+	role, _ := item["role"].(string)
+	if role != "assistant" {
+		return false
+	}
+	text := extractResponsesItemText(item["content"])
+	if text == "" {
+		return false
+	}
+	for _, existing := range structuredPreserved {
+		if normalizeResponsesItemType(existing) == "message" {
+			if existingRole, _ := existing["role"].(string); existingRole == "assistant" && extractResponsesItemText(existing["content"]) == text {
+				return true
+			}
+		}
+	}
+	for _, existing := range preservedTail {
+		if normalizeResponsesItemType(existing) == "message" {
+			if existingRole, _ := existing["role"].(string); existingRole == "assistant" && extractResponsesItemText(existing["content"]) == text {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func buildResponsesCompactionChunks(items []map[string]any) [][]map[string]any {
