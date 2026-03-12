@@ -98,6 +98,11 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 	for i := 0; i < len(compactedHead); i++ {
 		item := compactedHead[i]
 		itemType := normalizeResponsesItemType(item)
+		if combined, nextIndex, ok := summarizeCompactedMessageRun(compactedHead, i); ok {
+			summaryParts = append(summaryParts, combined)
+			i = nextIndex
+			continue
+		}
 		if combined, nextIndex, ok := summarizeCompactedToolExchange(compactedHead, i); ok {
 			summaryParts = append(summaryParts, combined)
 			i = nextIndex
@@ -280,6 +285,65 @@ func summarizeCompactedToolExchange(items []map[string]any, index int) (summary 
 		return fmt.Sprintf("Tool %s(%s)", name, args), index + 1, true
 	default:
 		return fmt.Sprintf("Tool %s executed", name), index + 1, true
+	}
+}
+
+func summarizeCompactedMessageRun(items []map[string]any, index int) (summary string, nextIndex int, ok bool) {
+	item := items[index]
+	if normalizeResponsesItemType(item) != "message" {
+		return "", index, false
+	}
+
+	role, _ := item["role"].(string)
+	if role != "user" && role != "assistant" {
+		return "", index, false
+	}
+
+	lines := make([]string, 0, 3)
+	currentRole := role
+	currentText := extractResponsesItemText(item["content"])
+	if currentText == "" {
+		return "", index, false
+	}
+	lines = append(lines, fmt.Sprintf("%s: %s", roleLabel(currentRole), currentText))
+	last := index
+
+	for j := index + 1; j < len(items) && len(lines) < 3; j++ {
+		next := items[j]
+		if normalizeResponsesItemType(next) != "message" {
+			break
+		}
+		nextRole, _ := next["role"].(string)
+		if nextRole != "user" && nextRole != "assistant" {
+			break
+		}
+		if nextRole == currentRole {
+			break
+		}
+		nextText := extractResponsesItemText(next["content"])
+		if nextText == "" {
+			break
+		}
+		lines = append(lines, fmt.Sprintf("%s: %s", roleLabel(nextRole), nextText))
+		currentRole = nextRole
+		last = j
+	}
+
+	if len(lines) < 2 {
+		return "", index, false
+	}
+
+	return strings.Join(lines, " | "), last, true
+}
+
+func roleLabel(role string) string {
+	switch role {
+	case "assistant":
+		return "Assistant"
+	case "user":
+		return "User"
+	default:
+		return role
 	}
 }
 
