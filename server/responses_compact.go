@@ -16,6 +16,8 @@ const (
 	responsesCompactRecentTailMaxChunks = 3
 	responsesCompactRecentTailMaxChars  = 1600
 	responsesCompactSummaryMaxChars     = 1200
+	responsesCompactSameRoleRunMaxItems = 3
+	responsesCompactSameRoleRunMaxChars = 180
 )
 
 func (s *Server) ResponsesCompactHandler(c *gin.Context) {
@@ -422,7 +424,7 @@ func summarizeCompactedSameRoleMessageRun(items []map[string]any, index int) (su
 		return "", index, false
 	}
 
-	lines := make([]string, 0, 2)
+	lines := make([]string, 0, responsesCompactSameRoleRunMaxItems)
 	text := extractResponsesItemText(item["content"])
 	if text == "" {
 		return "", index, false
@@ -430,7 +432,7 @@ func summarizeCompactedSameRoleMessageRun(items []map[string]any, index int) (su
 	lines = append(lines, text)
 	last := index
 
-	for j := index + 1; j < len(items) && len(lines) < 2; j++ {
+	for j := index + 1; j < len(items) && len(lines) < responsesCompactSameRoleRunMaxItems; j++ {
 		next := items[j]
 		if normalizeResponsesItemType(next) != "message" {
 			break
@@ -441,6 +443,9 @@ func summarizeCompactedSameRoleMessageRun(items []map[string]any, index int) (su
 		}
 		nextText := extractResponsesItemText(next["content"])
 		if nextText == "" {
+			break
+		}
+		if len(strings.Join(append(append([]string{}, lines...), nextText), " / ")) > responsesCompactSameRoleRunMaxChars {
 			break
 		}
 		lines = append(lines, nextText)
