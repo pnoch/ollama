@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1121,14 +1122,79 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if capture.path != "/v1/responses" {
 			t.Fatalf("expected upstream path /v1/responses, got %q", capture.path)
 		}
-		if len(capture.body) >= cloudResponsesInputCompactMax {
-			t.Fatalf("expected compacted upstream body smaller than threshold, got %d bytes", len(capture.body))
+		var capturePayload struct {
+			Input []map[string]any `json:"input"`
+		}
+		if err := json.Unmarshal(capture.body, &capturePayload); err != nil {
+			t.Fatalf("unmarshal compacted upstream body: %v", err)
+		}
+		if got := estimateResponsesInputTokens(capturePayload.Input); got > cloudResponsesInputCompactMax {
+			t.Fatalf("expected compacted upstream input estimate <= %d tokens, got %d", cloudResponsesInputCompactMax, got)
 		}
 		if !bytes.Contains(capture.body, []byte(`Previous conversation history was compacted by Ollama.`)) {
 			t.Fatalf("expected synthetic compacted summary, got %s", string(capture.body))
 		}
 		if bytes.Count(capture.body, []byte(`"type":"function_call"`)) > 1 || bytes.Count(capture.body, []byte(`"type":"function_call_output"`)) > 1 {
 			t.Fatalf("expected at most one recent tool exchange to remain, got %s", string(capture.body))
+		}
+	})
+
+	t.Run("v1 responses keeps low-token json-heavy cloud input uncompact", func(t *testing.T) {
+		var capture struct {
+			path string
+			body []byte
+		}
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capture.path = r.URL.Path
+			capture.body, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","model":"minimax-m2.5","output":[]}`)
+		}))
+		defer upstream.Close()
+
+		original := cloudProxyBaseURL
+		cloudProxyBaseURL = upstream.URL
+		t.Cleanup(func() { cloudProxyBaseURL = original })
+
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		var b strings.Builder
+		b.WriteString(`{"model":"minimax-m2.5:cloud","input":[`)
+		for i := 0; i < 150; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"type":"function_call","call_id":"call_%03d","name":"noop","arguments":"{}"}`, i)
+		}
+		b.WriteString(`],"stream":false}`)
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses", bytes.NewBufferString(b.String()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if capture.path != "/v1/responses" {
+			t.Fatalf("expected upstream path /v1/responses, got %q", capture.path)
+		}
+		if bytes.Contains(capture.body, []byte(`Previous conversation history was compacted by Ollama.`)) {
+			t.Fatalf("expected low-token cloud input to pass through without compaction, got %s", string(capture.body))
 		}
 	})
 
