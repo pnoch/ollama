@@ -1161,6 +1161,13 @@ trimmed:
 			break
 		}
 	}
+	part = strings.NewReplacer(
+		"“", `"`,
+		"”", `"`,
+		"‘", `'`,
+		"’", `'`,
+	).Replace(part)
+	part = strings.Join(strings.Fields(part), " ")
 	part = strings.TrimSpace(strings.TrimRight(part, " .,!?:;"))
 	return part
 }
