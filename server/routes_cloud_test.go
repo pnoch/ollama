@@ -1499,6 +1499,44 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses compaction preserves older user tool triple for larger models", func(t *testing.T) {
+		raw := json.RawMessage(`[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"older question"}]},
+			{"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"query\":\"older docs\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"older result"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older explanation"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 1"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 2"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 3"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 4"}]}
+		]`)
+
+		largeOutput, err := compactResponsesInputForModel(raw, "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		smallOutput, err := compactResponsesInputForModel(raw, "gpt-oss:20b")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		largeJSON, err := json.Marshal(largeOutput)
+		if err != nil {
+			t.Fatal(err)
+		}
+		smallJSON, err := json.Marshal(smallOutput)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !bytes.Contains(largeJSON, []byte(`"text":"older question"`)) || !bytes.Contains(largeJSON, []byte(`"type":"function_call"`)) || !bytes.Contains(largeJSON, []byte(`"text":"older explanation"`)) {
+			t.Fatalf("expected larger-context model to preserve older user/tool triple, got %s", string(largeJSON))
+		}
+		if bytes.Contains(smallJSON, []byte(`"text":"older question"`)) && bytes.Contains(smallJSON, []byte(`"type":"function_call"`)) && bytes.Contains(smallJSON, []byte(`"text":"older explanation"`)) {
+			t.Fatalf("expected smaller-context model to summarize at least part of the older user/tool triple, got %s", string(smallJSON))
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
@@ -2035,8 +2073,11 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Contains(body, []byte(`User: Check whether the release note mentions the fix. | Tool search({\"query\":\"release note\"}) -\u003e found release note | Assistant: The release note confirms the fix shipped.`)) {
-			t.Fatalf("expected older user/tool/assistant run to be summarized together, got %s", string(body))
+		if !bytes.Contains(body, []byte(`"type":"function_call"`)) || !bytes.Contains(body, []byte(`"type":"function_call_output"`)) {
+			t.Fatalf("expected older tool exchange to remain structured, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`User: Check whether the release note mentions the fix. | Assistant: The release note confirms the fix shipped.`)) {
+			t.Fatalf("expected older user/assistant context to remain represented in summary, got %s", string(body))
 		}
 	})
 
