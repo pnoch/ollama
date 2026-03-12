@@ -37,7 +37,7 @@ const (
 
 	cloudRequestedModelAliasKey   = "cloud_requested_model_alias"
 	cloudRequestedModelBaseKey    = "cloud_requested_model_base"
-	cloudResponsesInputCompactMax = 12000
+	cloudResponsesInputCompactMax = 3000
 )
 
 var (
@@ -323,13 +323,14 @@ func normalizeCloudResponsesInput(raw json.RawMessage) (json.RawMessage, error) 
 		normalized = append(normalized, expanded...)
 	}
 
+	estimatedTokens := estimateResponsesInputTokens(normalized)
+	if estimatedTokens <= cloudResponsesInputCompactMax {
+		return json.Marshal(normalized)
+	}
+
 	normalizedJSON, err := json.Marshal(normalized)
 	if err != nil {
 		return nil, err
-	}
-
-	if len(normalizedJSON) <= cloudResponsesInputCompactMax {
-		return normalizedJSON, nil
 	}
 
 	compacted, err := compactResponsesInput(normalizedJSON)
@@ -337,6 +338,41 @@ func normalizeCloudResponsesInput(raw json.RawMessage) (json.RawMessage, error) 
 		return nil, err
 	}
 	return json.Marshal(compacted)
+}
+
+func estimateResponsesInputTokens(items []map[string]any) int {
+	total := 0
+	for _, item := range items {
+		total += estimateResponsesValueTokens(item) + 8
+	}
+	return total
+}
+
+func estimateResponsesValueTokens(v any) int {
+	switch val := v.(type) {
+	case nil:
+		return 0
+	case string:
+		runeCount := len([]rune(val))
+		if runeCount == 0 {
+			return 0
+		}
+		return runeCount/4 + 1
+	case []any:
+		total := 0
+		for _, child := range val {
+			total += estimateResponsesValueTokens(child)
+		}
+		return total
+	case map[string]any:
+		total := 0
+		for _, child := range val {
+			total += estimateResponsesValueTokens(child)
+		}
+		return total
+	default:
+		return 1
+	}
 }
 
 func normalizeCloudResponsesInputItem(item map[string]any) ([]map[string]any, error) {
