@@ -1731,6 +1731,23 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses summary selector prefers richer structured lines", func(t *testing.T) {
+		plain1 := "Assistant: short note"
+		rich := "User: investigate release status | Tool search({\"query\":\"release notes\"}) -> found fix reference | Assistant: fix shipped in 0.17.7"
+		plain2 := "User: thanks"
+
+		selected := selectCompactionSummaryParts([]string{plain1, rich, plain2}, len("- ")+len(compactSnippet(rich))+1+len("- ")+len(compactSnippet(plain2))+1)
+		if len(selected) != 2 {
+			t.Fatalf("expected two selected summary parts, got %+v", selected)
+		}
+		if selected[0] != compactSnippet(rich) {
+			t.Fatalf("expected richer structured summary line to be kept, got %+v", selected)
+		}
+		if selected[1] != compactSnippet(plain2) {
+			t.Fatalf("expected remaining selected lines to stay chronological, got %+v", selected)
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
