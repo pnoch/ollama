@@ -1128,8 +1128,9 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if err := json.Unmarshal(capture.body, &capturePayload); err != nil {
 			t.Fatalf("unmarshal compacted upstream body: %v", err)
 		}
-		if got := estimateResponsesInputTokens(capturePayload.Input); got > cloudResponsesInputCompactMax {
-			t.Fatalf("expected compacted upstream input estimate <= %d tokens, got %d", cloudResponsesInputCompactMax, got)
+		threshold := cloudResponsesInputCompactThreshold("minimax-m2.5")
+		if got := estimateResponsesInputTokens(capturePayload.Input); got > threshold {
+			t.Fatalf("expected compacted upstream input estimate <= %d tokens, got %d", threshold, got)
 		}
 		if !bytes.Contains(capture.body, []byte(`Previous conversation history was compacted by Ollama.`)) {
 			t.Fatalf("expected synthetic compacted summary, got %s", string(capture.body))
@@ -1195,6 +1196,81 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 		if bytes.Contains(capture.body, []byte(`Previous conversation history was compacted by Ollama.`)) {
 			t.Fatalf("expected low-token cloud input to pass through without compaction, got %s", string(capture.body))
+		}
+	})
+
+	t.Run("v1 responses uses model-aware cloud compact threshold", func(t *testing.T) {
+		run := func(t *testing.T, model string) []byte {
+			t.Helper()
+
+			var capture struct {
+				path string
+				body []byte
+			}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				capture.path = r.URL.Path
+				capture.body, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","model":"`+strings.TrimSuffix(model, `:cloud`)+`","output":[]}`)
+			}))
+			defer upstream.Close()
+
+			original := cloudProxyBaseURL
+			cloudProxyBaseURL = upstream.URL
+			t.Cleanup(func() { cloudProxyBaseURL = original })
+
+			s := &Server{}
+			router, err := s.GenerateRoutes(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			local := httptest.NewServer(router)
+			defer local.Close()
+
+			var b strings.Builder
+			b.WriteString(`{"model":"`)
+			b.WriteString(model)
+			b.WriteString(`","input":[`)
+			for i := 0; i < 36; i++ {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				b.WriteString(`{"type":"message","role":"user","content":[{"type":"input_text","text":"`)
+				b.WriteString(strings.Repeat("mid size ", 50))
+				b.WriteString(`"}]}`)
+			}
+			b.WriteString(`],"stream":false}`)
+
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses", bytes.NewBufferString(b.String()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, err := local.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+			}
+			if capture.path != "/v1/responses" {
+				t.Fatalf("expected upstream path /v1/responses, got %q", capture.path)
+			}
+			return capture.body
+		}
+
+		minimaxBody := run(t, "minimax-m2.5:cloud")
+		if bytes.Contains(minimaxBody, []byte(`Previous conversation history was compacted by Ollama.`)) {
+			t.Fatalf("expected larger-context model to avoid compaction for mid-sized input, got %s", string(minimaxBody))
+		}
+
+		gptOSSBody := run(t, "gpt-oss:20b:cloud")
+		if !bytes.Contains(gptOSSBody, []byte(`Previous conversation history was compacted by Ollama.`)) {
+			t.Fatalf("expected smaller-context model to compact the same input, got %s", string(gptOSSBody))
 		}
 	})
 

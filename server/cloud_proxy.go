@@ -294,7 +294,7 @@ func replaceJSONModelField(body []byte, model string) ([]byte, error) {
 	payload["model"] = modelJSON
 
 	if rawInput, ok := payload["input"]; ok {
-		normalizedInput, err := normalizeCloudResponsesInput(rawInput)
+		normalizedInput, err := normalizeCloudResponsesInput(rawInput, model)
 		if err != nil {
 			return nil, err
 		}
@@ -304,7 +304,7 @@ func replaceJSONModelField(body []byte, model string) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
-func normalizeCloudResponsesInput(raw json.RawMessage) (json.RawMessage, error) {
+func normalizeCloudResponsesInput(raw json.RawMessage, model string) (json.RawMessage, error) {
 	if len(raw) == 0 {
 		return raw, nil
 	}
@@ -324,7 +324,7 @@ func normalizeCloudResponsesInput(raw json.RawMessage) (json.RawMessage, error) 
 	}
 
 	estimatedTokens := estimateResponsesInputTokens(normalized)
-	if estimatedTokens <= cloudResponsesInputCompactMax {
+	if estimatedTokens <= cloudResponsesInputCompactThreshold(model) {
 		return json.Marshal(normalized)
 	}
 
@@ -338,6 +338,20 @@ func normalizeCloudResponsesInput(raw json.RawMessage) (json.RawMessage, error) 
 		return nil, err
 	}
 	return json.Marshal(compacted)
+}
+
+func cloudResponsesInputCompactThreshold(model string) int {
+	limit := cloudResponsesInputCompactMax
+	if modelLimit, ok := lookupCloudModelLimit(model); ok && modelLimit.Context > 0 {
+		candidate := modelLimit.Context / 32
+		if candidate > limit {
+			limit = candidate
+		}
+	}
+	if limit > 12000 {
+		return 12000
+	}
+	return limit
 }
 
 func estimateResponsesInputTokens(items []map[string]any) int {
