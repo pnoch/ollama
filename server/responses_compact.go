@@ -87,7 +87,7 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 	otherItems := make([]map[string]any, 0, len(items))
 	summaryParts := make([]string, 0, len(items))
 	omittedCounts := map[string]int{}
-	structuredPreserved := make([]map[string]any, 0, 4)
+	structuredPreserved := make([]map[string]any, 0, 8)
 
 	for _, item := range items {
 		itemType := normalizeResponsesItemType(item)
@@ -103,7 +103,11 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 
 	chunkMax, charMax := responsesCompactTailBudget(model)
 	preservedTail, compactedHead := splitCompactedTailWithBudget(otherItems, chunkMax, charMax)
-	if selected, ok := selectStructuredCompactionCandidate(compactedHead, preservedTail, model); ok {
+	for n := 0; n < responsesStructuredChunkBudget(model); n++ {
+		selected, ok := selectStructuredCompactionCandidate(compactedHead, preservedTail, model)
+		if !ok {
+			break
+		}
 		structuredPreserved = append(structuredPreserved, selected.structured...)
 		if selected.tailDrop > 0 {
 			preservedTail = preservedTail[selected.tailDrop:]
@@ -212,6 +216,13 @@ func responsesCompactTailBudget(model string) (chunkMax, charMax int) {
 		return 5, 2600
 	}
 	return chunkMax, charMax
+}
+
+func responsesStructuredChunkBudget(model string) int {
+	if limit, ok := lookupCloudModelLimit(model); ok && limit.Context >= 200_000 {
+		return 2
+	}
+	return 1
 }
 
 func buildResponsesCompactionChunks(items []map[string]any) [][]map[string]any {
