@@ -246,12 +246,18 @@ func buildCompactionSummary(parts []string, omittedCounts map[string]int) string
 
 	if len(parts) > 0 {
 		b.WriteString("Preserved summary:\n")
-		for _, part := range parts {
+		seen := make(map[string]struct{}, len(parts))
+		for i := len(parts) - 1; i >= 0; i-- {
 			if b.Len() >= responsesCompactSummaryMaxChars {
 				break
 			}
+			part := compactSnippet(parts[i])
+			if _, ok := seen[part]; ok {
+				continue
+			}
+			seen[part] = struct{}{}
 			b.WriteString("- ")
-			b.WriteString(compactSnippet(part))
+			b.WriteString(part)
 			b.WriteByte('\n')
 		}
 	}
