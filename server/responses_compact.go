@@ -371,6 +371,7 @@ type structuredCompactionCandidate struct {
 	headEnd    int
 	tailDrop   int
 	score      int
+	recency    int
 }
 
 func selectStructuredCompactionCandidate(compactedHead, preservedTail []map[string]any, model string) (structuredCompactionCandidate, bool) {
@@ -380,7 +381,7 @@ func selectStructuredCompactionCandidate(compactedHead, preservedTail []map[stri
 		if !ok {
 			return
 		}
-		if !found || candidate.score > best.score {
+		if !found || candidate.score > best.score || (candidate.score == best.score && candidate.recency > best.recency) {
 			best = candidate
 			found = true
 		}
@@ -423,6 +424,7 @@ func candidateStructuredToolExchange(items []map[string]any, index int) (structu
 		headStart:  index,
 		headEnd:    nextIndex,
 		score:      30,
+		recency:    index,
 	}, true
 }
 
@@ -460,6 +462,7 @@ func candidateStructuredToolExchangeWithAssistant(items []map[string]any, index 
 		headStart:  index,
 		headEnd:    nextIndex,
 		score:      50,
+		recency:    index,
 	}, true
 }
 
@@ -498,6 +501,7 @@ func candidateStructuredUserToolRun(items []map[string]any, index int, model str
 		headStart:  index,
 		headEnd:    nextIndex,
 		score:      70,
+		recency:    index,
 	}, true
 }
 
@@ -511,6 +515,7 @@ func candidateStructuredMessagePair(items []map[string]any, index int, model str
 		headStart:  index,
 		headEnd:    nextIndex,
 		score:      40,
+		recency:    index,
 	}, true
 }
 
@@ -567,6 +572,7 @@ func candidateBoundaryMessagePair(compactedHead, preservedTail []map[string]any,
 		headEnd:    len(compactedHead) - 1,
 		tailDrop:   1,
 		score:      45,
+		recency:    len(compactedHead) - 1,
 	}, true
 }
 
@@ -595,6 +601,7 @@ func candidateBoundaryUserToolRun(compactedHead, preservedTail []map[string]any,
 		headEnd:    len(compactedHead) - 1,
 		tailDrop:   nextIndex + 1,
 		score:      75,
+		recency:    len(compactedHead) - 1,
 	}, true
 }
 
@@ -632,6 +639,7 @@ func candidateBoundaryUserToolAssistantRun(compactedHead, preservedTail []map[st
 		headEnd:    len(compactedHead) - 1,
 		tailDrop:   1,
 		score:      80,
+		recency:    len(compactedHead) - 1,
 	}, true
 }
 
