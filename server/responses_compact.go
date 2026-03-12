@@ -951,6 +951,7 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 		index   int
 		score   int
 		kind    string
+		density int
 		lineLen int
 	}
 
@@ -968,8 +969,9 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 			kind:    classifyCompactionSummaryPart(part),
 			lineLen: len("- ") + len(part) + 1,
 		}
+		candidate.density = scoreCompactionSummaryDensity(candidate.score, candidate.lineLen)
 		if existing, ok := candidateByKey[key]; ok {
-			if existing.score > candidate.score || (existing.score == candidate.score && existing.index > candidate.index) {
+			if existing.score > candidate.score || (existing.score == candidate.score && (existing.density > candidate.density || (existing.density == candidate.density && existing.index > candidate.index))) {
 				continue
 			}
 		}
@@ -982,6 +984,12 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 	slices.SortFunc(candidates, func(a, b summaryCandidate) int {
 		if a.score != b.score {
 			if a.score > b.score {
+				return -1
+			}
+			return 1
+		}
+		if a.density != b.density {
+			if a.density > b.density {
 				return -1
 			}
 			return 1
@@ -1007,7 +1015,8 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 				continue
 			}
 			effective := candidate.score - selectedKinds[candidate.kind]*compactionSummaryKindPenalty(candidate.kind)
-			if bestIndex == -1 || effective > bestEffective || (effective == bestEffective && candidate.index > remaining[bestIndex].index) {
+			effectiveDensity := scoreCompactionSummaryDensity(effective, candidate.lineLen)
+			if bestIndex == -1 || effective > bestEffective || (effective == bestEffective && (effectiveDensity > scoreCompactionSummaryDensity(bestEffective, remaining[bestIndex].lineLen) || (effectiveDensity == scoreCompactionSummaryDensity(bestEffective, remaining[bestIndex].lineLen) && candidate.index > remaining[bestIndex].index))) {
 				bestIndex = i
 				bestEffective = effective
 			}
@@ -1109,6 +1118,13 @@ func compactionSummaryKindPenalty(kind string) int {
 	default:
 		return 10
 	}
+}
+
+func scoreCompactionSummaryDensity(score, lineLen int) int {
+	if lineLen <= 0 {
+		return score * 100
+	}
+	return score * 100 / lineLen
 }
 
 func normalizeCompactionSummaryPart(part string) string {
