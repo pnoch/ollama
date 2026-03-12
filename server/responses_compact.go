@@ -372,6 +372,7 @@ func summarizeCompactedMessageRun(items []map[string]any, index int) (summary st
 		return "", index, false
 	}
 	lines = append(lines, fmt.Sprintf("%s: %s", roleLabel(currentRole), currentText))
+	lastText := currentText
 	last := index
 
 	for j := index + 1; j < len(items) && len(lines) < 3; j++ {
@@ -390,8 +391,14 @@ func summarizeCompactedMessageRun(items []map[string]any, index int) (summary st
 		if nextText == "" {
 			break
 		}
+		if nextText == lastText {
+			currentRole = nextRole
+			last = j
+			continue
+		}
 		lines = append(lines, fmt.Sprintf("%s: %s", roleLabel(nextRole), nextText))
 		currentRole = nextRole
+		lastText = nextText
 		last = j
 	}
 
