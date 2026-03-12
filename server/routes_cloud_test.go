@@ -1200,8 +1200,8 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if last.Role != "assistant" || len(last.Content) == 0 {
 			t.Fatalf("expected assistant summary message, got %+v", last)
 		}
-		if !strings.Contains(last.Content[0].Text, "previous assistant answer") {
-			t.Fatalf("expected summary to include assistant history, got %q", last.Content[0].Text)
+		if payload.Output[2].Role != "assistant" || payload.Output[2].Content[0].Text != "previous assistant answer" {
+			t.Fatalf("expected latest assistant message to be preserved, got %+v", payload.Output)
 		}
 		if !strings.Contains(last.Content[0].Text, "search result payload") {
 			t.Fatalf("expected summary to include tool output, got %q", last.Content[0].Text)
@@ -1259,6 +1259,55 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 		if !bytes.Contains(body, []byte(`user: u1`)) {
 			t.Fatalf("expected dropped user message to appear in summary, got %s", string(body))
+		}
+	})
+
+	t.Run("v1 responses compact keeps most recent assistant message", func(t *testing.T) {
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{
+			"model":"minimax-m2.5:cloud",
+			"input":[
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older assistant"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"latest assistant"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"latest user"}]}
+			]
+		}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses/compact", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(body, []byte(`"text":"latest assistant"`)) {
+			t.Fatalf("expected latest assistant message to remain, got %s", string(body))
+		}
+		if bytes.Contains(body, []byte(`"text":"older assistant"`)) {
+			t.Fatalf("expected older assistant message to be compacted, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`Assistant: older assistant`)) {
+			t.Fatalf("expected older assistant message in summary, got %s", string(body))
 		}
 	})
 
