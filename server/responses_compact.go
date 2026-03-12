@@ -87,7 +87,7 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 	otherItems := make([]map[string]any, 0, len(items))
 	summaryParts := make([]string, 0, len(items))
 	omittedCounts := map[string]int{}
-	structuredPreserved := make([]map[string]any, 0, 2)
+	structuredPreserved := make([]map[string]any, 0, 4)
 
 	for _, item := range items {
 		itemType := normalizeResponsesItemType(item)
@@ -103,31 +103,21 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 
 	chunkMax, charMax := responsesCompactTailBudget(model)
 	preservedTail, compactedHead := splitCompactedTailWithBudget(otherItems, chunkMax, charMax)
-	if structured, newTail, newHead, ok := extractBoundaryStructuredMessagePair(compactedHead, preservedTail, model); ok {
-		structuredPreserved = append(structuredPreserved, structured...)
-		preservedTail = newTail
-		compactedHead = newHead
+	if selected, ok := selectStructuredCompactionCandidate(compactedHead, preservedTail, model); ok {
+		structuredPreserved = append(structuredPreserved, selected.structured...)
+		if selected.tailDrop > 0 {
+			preservedTail = preservedTail[selected.tailDrop:]
+		}
+		if selected.headStart >= 0 && selected.headEnd >= selected.headStart {
+			compactedHead = append(
+				append([]map[string]any{}, compactedHead[:selected.headStart]...),
+				compactedHead[selected.headEnd+1:]...,
+			)
+		}
 	}
 	for i := 0; i < len(compactedHead); i++ {
 		item := compactedHead[i]
 		itemType := normalizeResponsesItemType(item)
-		if len(structuredPreserved) == 0 {
-			if structured, nextIndex, ok := extractStructuredCompactedToolExchangeWithAssistant(compactedHead, i, model); ok {
-				structuredPreserved = append(structuredPreserved, structured...)
-				i = nextIndex
-				continue
-			}
-			if structured, nextIndex, ok := extractStructuredCompactedToolExchange(compactedHead, i); ok {
-				structuredPreserved = append(structuredPreserved, structured...)
-				i = nextIndex
-				continue
-			}
-			if structured, nextIndex, ok := extractStructuredCompactedMessagePair(compactedHead, i, model); ok {
-				structuredPreserved = append(structuredPreserved, structured...)
-				i = nextIndex
-				continue
-			}
-		}
 		if combined, nextIndex, ok := summarizeCompactedUserToolAssistantRun(compactedHead, i); ok {
 			summaryParts = append(summaryParts, combined)
 			i = nextIndex
@@ -375,6 +365,67 @@ func extractStructuredCompactedToolExchange(items []map[string]any, index int) (
 	return []map[string]any{item, next}, index + 1, true
 }
 
+type structuredCompactionCandidate struct {
+	structured []map[string]any
+	headStart  int
+	headEnd    int
+	tailDrop   int
+	score      int
+}
+
+func selectStructuredCompactionCandidate(compactedHead, preservedTail []map[string]any, model string) (structuredCompactionCandidate, bool) {
+	best := structuredCompactionCandidate{}
+	found := false
+	consider := func(candidate structuredCompactionCandidate, ok bool) {
+		if !ok {
+			return
+		}
+		if !found || candidate.score > best.score {
+			best = candidate
+			found = true
+		}
+	}
+
+	if candidate, ok := candidateBoundaryUserToolRun(compactedHead, preservedTail, model); ok {
+		consider(candidate, true)
+	}
+	if candidate, ok := candidateBoundaryUserToolAssistantRun(compactedHead, preservedTail, model); ok {
+		consider(candidate, true)
+	}
+	if candidate, ok := candidateBoundaryMessagePair(compactedHead, preservedTail, model); ok {
+		consider(candidate, true)
+	}
+	for i := 0; i < len(compactedHead); i++ {
+		if candidate, ok := candidateStructuredUserToolRun(compactedHead, i, model); ok {
+			consider(candidate, true)
+		}
+		if candidate, ok := candidateStructuredToolExchangeWithAssistant(compactedHead, i, model); ok {
+			consider(candidate, true)
+		}
+		if candidate, ok := candidateStructuredToolExchange(compactedHead, i); ok {
+			consider(candidate, true)
+		}
+		if candidate, ok := candidateStructuredMessagePair(compactedHead, i, model); ok {
+			consider(candidate, true)
+		}
+	}
+
+	return best, found
+}
+
+func candidateStructuredToolExchange(items []map[string]any, index int) (structuredCompactionCandidate, bool) {
+	structured, nextIndex, ok := extractStructuredCompactedToolExchange(items, index)
+	if !ok {
+		return structuredCompactionCandidate{}, false
+	}
+	return structuredCompactionCandidate{
+		structured: structured,
+		headStart:  index,
+		headEnd:    nextIndex,
+		score:      30,
+	}, true
+}
+
 func extractStructuredCompactedToolExchangeWithAssistant(items []map[string]any, index int, model string) (structured []map[string]any, nextIndex int, ok bool) {
 	if !allowsStructuredCompactedMessagePair(model) {
 		return nil, index, false
@@ -397,6 +448,70 @@ func extractStructuredCompactedToolExchangeWithAssistant(items []map[string]any,
 	}
 
 	return append(pair, next), nextIndex + 1, true
+}
+
+func candidateStructuredToolExchangeWithAssistant(items []map[string]any, index int, model string) (structuredCompactionCandidate, bool) {
+	structured, nextIndex, ok := extractStructuredCompactedToolExchangeWithAssistant(items, index, model)
+	if !ok {
+		return structuredCompactionCandidate{}, false
+	}
+	return structuredCompactionCandidate{
+		structured: structured,
+		headStart:  index,
+		headEnd:    nextIndex,
+		score:      50,
+	}, true
+}
+
+func extractStructuredCompactedUserToolRun(items []map[string]any, index int, model string) (structured []map[string]any, nextIndex int, ok bool) {
+	if !allowsStructuredCompactedMessagePair(model) {
+		return nil, index, false
+	}
+	if index+1 >= len(items) {
+		return nil, index, false
+	}
+
+	item := items[index]
+	if normalizeResponsesItemType(item) != "message" {
+		return nil, index, false
+	}
+	role, _ := item["role"].(string)
+	if role != "user" || extractResponsesItemText(item["content"]) == "" {
+		return nil, index, false
+	}
+
+	triple, nextIndex, ok := extractStructuredCompactedToolExchangeWithAssistant(items, index+1, model)
+	if !ok {
+		return nil, index, false
+	}
+
+	return append([]map[string]any{item}, triple...), nextIndex, true
+}
+
+func candidateStructuredUserToolRun(items []map[string]any, index int, model string) (structuredCompactionCandidate, bool) {
+	structured, nextIndex, ok := extractStructuredCompactedUserToolRun(items, index, model)
+	if !ok {
+		return structuredCompactionCandidate{}, false
+	}
+	return structuredCompactionCandidate{
+		structured: structured,
+		headStart:  index,
+		headEnd:    nextIndex,
+		score:      70,
+	}, true
+}
+
+func candidateStructuredMessagePair(items []map[string]any, index int, model string) (structuredCompactionCandidate, bool) {
+	structured, nextIndex, ok := extractStructuredCompactedMessagePair(items, index, model)
+	if !ok {
+		return structuredCompactionCandidate{}, false
+	}
+	return structuredCompactionCandidate{
+		structured: structured,
+		headStart:  index,
+		headEnd:    nextIndex,
+		score:      40,
+	}, true
 }
 
 func extractStructuredCompactedMessagePair(items []map[string]any, index int, model string) (structured []map[string]any, nextIndex int, ok bool) {
@@ -425,29 +540,99 @@ func extractStructuredCompactedMessagePair(items []map[string]any, index int, mo
 	return []map[string]any{item, next}, index + 1, true
 }
 
-func extractBoundaryStructuredMessagePair(compactedHead, preservedTail []map[string]any, model string) (structured, newTail, newHead []map[string]any, ok bool) {
+func candidateBoundaryMessagePair(compactedHead, preservedTail []map[string]any, model string) (structuredCompactionCandidate, bool) {
 	if !allowsStructuredCompactedMessagePair(model) {
-		return nil, preservedTail, compactedHead, false
+		return structuredCompactionCandidate{}, false
 	}
 	if len(compactedHead) == 0 || len(preservedTail) == 0 {
-		return nil, preservedTail, compactedHead, false
+		return structuredCompactionCandidate{}, false
 	}
 
 	lastHead := compactedHead[len(compactedHead)-1]
 	firstTail := preservedTail[0]
 	if normalizeResponsesItemType(lastHead) != "message" || normalizeResponsesItemType(firstTail) != "message" {
-		return nil, preservedTail, compactedHead, false
+		return structuredCompactionCandidate{}, false
 	}
 	role, _ := lastHead["role"].(string)
 	nextRole, _ := firstTail["role"].(string)
 	if role != "user" || nextRole != "assistant" {
-		return nil, preservedTail, compactedHead, false
+		return structuredCompactionCandidate{}, false
 	}
 	if extractResponsesItemText(lastHead["content"]) == "" || extractResponsesItemText(firstTail["content"]) == "" {
-		return nil, preservedTail, compactedHead, false
+		return structuredCompactionCandidate{}, false
 	}
+	return structuredCompactionCandidate{
+		structured: []map[string]any{lastHead, firstTail},
+		headStart:  len(compactedHead) - 1,
+		headEnd:    len(compactedHead) - 1,
+		tailDrop:   1,
+		score:      45,
+	}, true
+}
 
-	return []map[string]any{lastHead, firstTail}, preservedTail[1:], compactedHead[:len(compactedHead)-1], true
+func candidateBoundaryUserToolRun(compactedHead, preservedTail []map[string]any, model string) (structuredCompactionCandidate, bool) {
+	if !allowsStructuredCompactedMessagePair(model) {
+		return structuredCompactionCandidate{}, false
+	}
+	if len(compactedHead) == 0 || len(preservedTail) < 3 {
+		return structuredCompactionCandidate{}, false
+	}
+	lastHead := compactedHead[len(compactedHead)-1]
+	if normalizeResponsesItemType(lastHead) != "message" {
+		return structuredCompactionCandidate{}, false
+	}
+	role, _ := lastHead["role"].(string)
+	if role != "user" || extractResponsesItemText(lastHead["content"]) == "" {
+		return structuredCompactionCandidate{}, false
+	}
+	triple, nextIndex, ok := extractStructuredCompactedToolExchangeWithAssistant(preservedTail, 0, model)
+	if !ok {
+		return structuredCompactionCandidate{}, false
+	}
+	return structuredCompactionCandidate{
+		structured: append([]map[string]any{lastHead}, triple...),
+		headStart:  len(compactedHead) - 1,
+		headEnd:    len(compactedHead) - 1,
+		tailDrop:   nextIndex + 1,
+		score:      75,
+	}, true
+}
+
+func candidateBoundaryUserToolAssistantRun(compactedHead, preservedTail []map[string]any, model string) (structuredCompactionCandidate, bool) {
+	if !allowsStructuredCompactedMessagePair(model) {
+		return structuredCompactionCandidate{}, false
+	}
+	if len(compactedHead) < 3 || len(preservedTail) == 0 {
+		return structuredCompactionCandidate{}, false
+	}
+	user := compactedHead[len(compactedHead)-3]
+	tool := compactedHead[len(compactedHead)-2]
+	toolOut := compactedHead[len(compactedHead)-1]
+	firstTail := preservedTail[0]
+	if normalizeResponsesItemType(user) != "message" || normalizeResponsesItemType(firstTail) != "message" {
+		return structuredCompactionCandidate{}, false
+	}
+	role, _ := user["role"].(string)
+	tailRole, _ := firstTail["role"].(string)
+	if role != "user" || tailRole != "assistant" {
+		return structuredCompactionCandidate{}, false
+	}
+	pair, _, ok := extractStructuredCompactedToolExchange(compactedHead, len(compactedHead)-2)
+	if !ok {
+		return structuredCompactionCandidate{}, false
+	}
+	if extractResponsesItemText(user["content"]) == "" || extractResponsesItemText(firstTail["content"]) == "" {
+		return structuredCompactionCandidate{}, false
+	}
+	_ = tool
+	_ = toolOut
+	return structuredCompactionCandidate{
+		structured: append([]map[string]any{user}, append(pair, firstTail)...),
+		headStart:  len(compactedHead) - 3,
+		headEnd:    len(compactedHead) - 1,
+		tailDrop:   1,
+		score:      80,
+	}, true
 }
 
 func allowsStructuredCompactedMessagePair(model string) bool {
