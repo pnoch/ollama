@@ -87,7 +87,7 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 	otherItems := make([]map[string]any, 0, len(items))
 	summaryParts := make([]string, 0, len(items))
 	omittedCounts := map[string]int{}
-	structuredPreserved := make([]map[string]any, 0, 8)
+	structuredSelections := make([]structuredCompactionCandidate, 0, 2)
 
 	for _, item := range items {
 		itemType := normalizeResponsesItemType(item)
@@ -108,7 +108,7 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 		if !ok {
 			break
 		}
-		structuredPreserved = append(structuredPreserved, selected.structured...)
+		structuredSelections = append(structuredSelections, selected)
 		if selected.tailDrop > 0 {
 			preservedTail = preservedTail[selected.tailDrop:]
 		}
@@ -157,7 +157,20 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 	output := make([]map[string]any, 0, len(systemAndDeveloper)+len(preservedTail)+1)
 	output = append(output, systemAndDeveloper...)
 	output = append(output, preservedTail...)
-	if len(structuredPreserved) > 0 {
+	if len(structuredSelections) > 0 {
+		slices.SortFunc(structuredSelections, func(a, b structuredCompactionCandidate) int {
+			if a.headStart < b.headStart {
+				return -1
+			}
+			if a.headStart > b.headStart {
+				return 1
+			}
+			return 0
+		})
+		structuredPreserved := make([]map[string]any, 0, 8)
+		for _, selection := range structuredSelections {
+			structuredPreserved = append(structuredPreserved, selection.structured...)
+		}
 		output = append(output, structuredPreserved...)
 	}
 
