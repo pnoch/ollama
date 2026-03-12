@@ -112,6 +112,11 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 		item := compactedHead[i]
 		itemType := normalizeResponsesItemType(item)
 		if len(structuredPreserved) == 0 {
+			if structured, nextIndex, ok := extractStructuredCompactedToolExchangeWithAssistant(compactedHead, i, model); ok {
+				structuredPreserved = append(structuredPreserved, structured...)
+				i = nextIndex
+				continue
+			}
 			if structured, nextIndex, ok := extractStructuredCompactedToolExchange(compactedHead, i); ok {
 				structuredPreserved = append(structuredPreserved, structured...)
 				i = nextIndex
@@ -368,6 +373,30 @@ func extractStructuredCompactedToolExchange(items []map[string]any, index int) (
 	}
 
 	return []map[string]any{item, next}, index + 1, true
+}
+
+func extractStructuredCompactedToolExchangeWithAssistant(items []map[string]any, index int, model string) (structured []map[string]any, nextIndex int, ok bool) {
+	if !allowsStructuredCompactedMessagePair(model) {
+		return nil, index, false
+	}
+	pair, nextIndex, ok := extractStructuredCompactedToolExchange(items, index)
+	if !ok || nextIndex+1 >= len(items) {
+		return nil, index, false
+	}
+
+	next := items[nextIndex+1]
+	if normalizeResponsesItemType(next) != "message" {
+		return nil, index, false
+	}
+	role, _ := next["role"].(string)
+	if role != "assistant" {
+		return nil, index, false
+	}
+	if extractResponsesItemText(next["content"]) == "" {
+		return nil, index, false
+	}
+
+	return append(pair, next), nextIndex + 1, true
 }
 
 func extractStructuredCompactedMessagePair(items []map[string]any, index int, model string) (structured []map[string]any, nextIndex int, ok bool) {
