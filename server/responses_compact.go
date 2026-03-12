@@ -63,6 +63,10 @@ func (s *Server) ResponsesCompactHandler(c *gin.Context) {
 }
 
 func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
+	return compactResponsesInputForModel(raw, "")
+}
+
+func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[string]any, error) {
 	if len(raw) == 0 {
 		return []map[string]any{}, nil
 	}
@@ -83,6 +87,7 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 	otherItems := make([]map[string]any, 0, len(items))
 	summaryParts := make([]string, 0, len(items))
 	omittedCounts := map[string]int{}
+	structuredPreserved := make([]map[string]any, 0, 2)
 
 	for _, item := range items {
 		itemType := normalizeResponsesItemType(item)
@@ -96,10 +101,18 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 		otherItems = append(otherItems, item)
 	}
 
-	preservedTail, compactedHead := splitCompactedTail(otherItems)
+	chunkMax, charMax := responsesCompactTailBudget(model)
+	preservedTail, compactedHead := splitCompactedTailWithBudget(otherItems, chunkMax, charMax)
 	for i := 0; i < len(compactedHead); i++ {
 		item := compactedHead[i]
 		itemType := normalizeResponsesItemType(item)
+		if len(structuredPreserved) == 0 {
+			if structured, nextIndex, ok := extractStructuredCompactedToolExchange(compactedHead, i); ok {
+				structuredPreserved = append(structuredPreserved, structured...)
+				i = nextIndex
+				continue
+			}
+		}
 		if combined, nextIndex, ok := summarizeCompactedUserToolAssistantRun(compactedHead, i); ok {
 			summaryParts = append(summaryParts, combined)
 			i = nextIndex
@@ -135,6 +148,9 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 	output := make([]map[string]any, 0, len(systemAndDeveloper)+len(preservedTail)+1)
 	output = append(output, systemAndDeveloper...)
 	output = append(output, preservedTail...)
+	if len(structuredPreserved) > 0 {
+		output = append(output, structuredPreserved...)
+	}
 
 	if summaryText := buildCompactionSummary(summaryParts, omittedCounts); summaryText != "" {
 		output = append(output, makeResponsesAssistantMessage(summaryText))
@@ -148,6 +164,11 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 }
 
 func splitCompactedTail(items []map[string]any) (preservedTail []map[string]any, compactedHead []map[string]any) {
+	chunkMax, charMax := responsesCompactTailBudget("")
+	return splitCompactedTailWithBudget(items, chunkMax, charMax)
+}
+
+func splitCompactedTailWithBudget(items []map[string]any, chunkMax, charMax int) (preservedTail []map[string]any, compactedHead []map[string]any) {
 	if len(items) == 0 {
 		return nil, nil
 	}
@@ -161,10 +182,10 @@ func splitCompactedTail(items []map[string]any) (preservedTail []map[string]any,
 		if err != nil {
 			break
 		}
-		if len(chunks)-startChunk >= responsesCompactRecentTailMaxChunks {
+		if len(chunks)-startChunk >= chunkMax {
 			break
 		}
-		if size+len(candidateJSON) > responsesCompactRecentTailMaxChars {
+		if size+len(candidateJSON) > charMax {
 			break
 		}
 		startChunk--
@@ -177,6 +198,15 @@ func splitCompactedTail(items []map[string]any) (preservedTail []map[string]any,
 	}
 
 	return items[startItem:], items[:startItem]
+}
+
+func responsesCompactTailBudget(model string) (chunkMax, charMax int) {
+	chunkMax = responsesCompactRecentTailMaxChunks
+	charMax = responsesCompactRecentTailMaxChars
+	if limit, ok := lookupCloudModelLimit(model); ok && limit.Context >= 200_000 {
+		return 5, 2600
+	}
+	return chunkMax, charMax
 }
 
 func buildResponsesCompactionChunks(items []map[string]any) [][]map[string]any {
@@ -303,6 +333,31 @@ func summarizeCompactedToolExchange(items []map[string]any, index int) (summary 
 	default:
 		return fmt.Sprintf("Tool %s executed", name), index + 1, true
 	}
+}
+
+func extractStructuredCompactedToolExchange(items []map[string]any, index int) (structured []map[string]any, nextIndex int, ok bool) {
+	item := items[index]
+	itemType := normalizeResponsesItemType(item)
+	if itemType != "function_call" && itemType != "custom_tool_call" {
+		return nil, index, false
+	}
+	if index+1 >= len(items) {
+		return nil, index, false
+	}
+
+	next := items[index+1]
+	nextType := normalizeResponsesItemType(next)
+	if nextType != "function_call_output" && nextType != "custom_tool_call_output" {
+		return nil, index, false
+	}
+
+	callID, _ := item["call_id"].(string)
+	nextCallID, _ := next["call_id"].(string)
+	if callID == "" || callID != nextCallID {
+		return nil, index, false
+	}
+
+	return []map[string]any{item, next}, index + 1, true
 }
 
 func summarizeCompactedToolExchangeWithAssistant(items []map[string]any, index int) (summary string, nextIndex int, ok bool) {
