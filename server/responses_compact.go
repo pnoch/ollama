@@ -156,7 +156,7 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 
 	output := make([]map[string]any, 0, len(systemAndDeveloper)+len(preservedTail)+1)
 	output = append(output, systemAndDeveloper...)
-	output = append(output, preservedTail...)
+	structuredPreserved := make([]map[string]any, 0, 8)
 	if len(structuredSelections) > 0 {
 		slices.SortFunc(structuredSelections, func(a, b structuredCompactionCandidate) int {
 			if a.headStart < b.headStart {
@@ -167,7 +167,6 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 			}
 			return 0
 		})
-		structuredPreserved := make([]map[string]any, 0, 8)
 		for _, selection := range structuredSelections {
 			for _, item := range selection.structured {
 				if shouldSkipStructuredPreservedItem(structuredPreserved, preservedTail, item) {
@@ -176,8 +175,9 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 				structuredPreserved = append(structuredPreserved, item)
 			}
 		}
-		output = append(output, structuredPreserved...)
 	}
+	output = append(output, structuredPreserved...)
+	output = append(output, preservedTail...)
 
 	if summaryText := buildCompactionSummary(summaryParts, omittedCounts); summaryText != "" {
 		output = append(output, makeResponsesAssistantMessage(summaryText))

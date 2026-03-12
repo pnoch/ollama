@@ -1678,6 +1678,35 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses keeps older structured chunks before recent tail", func(t *testing.T) {
+		raw := json.RawMessage(`[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"older question"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older answer"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 1"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 2"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 3"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 4"}]}
+		]`)
+
+		output, err := compactResponsesInputForModel(raw, "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		olderIdx := bytes.Index(body, []byte(`older answer`))
+		recentIdx := bytes.Index(body, []byte(`recent 1`))
+		if olderIdx == -1 || recentIdx == -1 {
+			t.Fatalf("expected both structured and tail content in output, got %s", string(body))
+		}
+		if olderIdx > recentIdx {
+			t.Fatalf("expected older structured content before recent tail, got %s", string(body))
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
