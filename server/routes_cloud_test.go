@@ -1398,6 +1398,41 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses preserves latest assistant options list for referential reply", func(t *testing.T) {
+		longOption := strings.Repeat("remote connection health indicators and queue controls ", 8)
+		options := strings.Join([]string{
+			"1. End-to-end testing " + longOption,
+			"2. Model inventory UI improvements " + longOption,
+			"3. Connection health indicators " + longOption,
+			"4. Job queue management " + longOption,
+		}, "\n")
+		raw := json.RawMessage(fmt.Sprintf(`[
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":%q}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"3 and 4"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Need clarification?"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 1"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 2"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 3"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 4"}]}
+		]`, options))
+
+		output, err := compactResponsesInputForModel(raw, "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !bytes.Contains(body, []byte(`Connection health indicators`)) || !bytes.Contains(body, []byte(`Job queue management`)) {
+			t.Fatalf("expected latest assistant options list to remain preserved for referential reply, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`3 and 4`)) {
+			t.Fatalf("expected short referential user reply to remain alongside preserved list, got %s", string(body))
+		}
+	})
+
 	t.Run("v1 responses round-trip normalization preserves planted continuity facts", func(t *testing.T) {
 		items := []map[string]any{
 			makeResponsesInputMessage("user", "project=nebula ticket=RAVEN-27"),
