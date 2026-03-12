@@ -900,53 +900,38 @@ func buildCompactionSummary(parts []string, omittedCounts map[string]int) string
 		return ""
 	}
 
+	const compactedHistoryPrefix = "Previous conversation history was compacted by Ollama.\n\n"
+	const preservedSummaryHeader = "Preserved summary:\n"
+
 	var b strings.Builder
-	b.WriteString("Previous conversation history was compacted by Ollama.\n\n")
+	b.WriteString(compactedHistoryPrefix)
+
+	additionalItemsSection := buildCompactionOmittedCountsSection(omittedCounts)
+	summaryBudget := responsesCompactSummaryMaxChars - len(additionalItemsSection)
+	if additionalItemsSection != "" {
+		summaryBudget--
+	}
+	if summaryBudget < len(compactedHistoryPrefix) {
+		summaryBudget = len(compactedHistoryPrefix)
+	}
 
 	if len(parts) > 0 {
-		b.WriteString("Preserved summary:\n")
-		seen := make(map[string]struct{}, len(parts))
-		selected := make([]string, 0, len(parts))
-		for i := len(parts) - 1; i >= 0; i-- {
-			if b.Len() >= responsesCompactSummaryMaxChars {
-				break
+		selected := selectCompactionSummaryParts(parts, summaryBudget-len(compactedHistoryPrefix)-len(preservedSummaryHeader))
+		if len(selected) > 0 {
+			b.WriteString(preservedSummaryHeader)
+			for _, part := range selected {
+				b.WriteString("- ")
+				b.WriteString(part)
+				b.WriteByte('\n')
 			}
-			part := compactSnippet(parts[i])
-			if _, ok := seen[part]; ok {
-				continue
-			}
-			seen[part] = struct{}{}
-			selected = append(selected, part)
-			b.WriteString("- ")
-			b.WriteString(part)
-			b.WriteByte('\n')
-		}
-		b.Reset()
-		b.WriteString("Previous conversation history was compacted by Ollama.\n\n")
-		b.WriteString("Preserved summary:\n")
-		for i := len(selected) - 1; i >= 0; i-- {
-			if b.Len() >= responsesCompactSummaryMaxChars {
-				break
-			}
-			b.WriteString("- ")
-			b.WriteString(selected[i])
-			b.WriteByte('\n')
 		}
 	}
 
-	if len(omittedCounts) > 0 {
-		if len(parts) > 0 {
+	if additionalItemsSection != "" {
+		if b.Len() > len(compactedHistoryPrefix) {
 			b.WriteByte('\n')
 		}
-		b.WriteString("Additional compacted items:")
-		keys := make([]string, 0, len(omittedCounts))
-		for key := range omittedCounts {
-			keys = append(keys, key)
-		}
-		slices.Sort(keys)
-		for _, key := range keys {
-			b.WriteString(fmt.Sprintf(" %s=%d", key, omittedCounts[key]))
-		}
+		b.WriteString(additionalItemsSection)
 	}
 
 	summary := strings.TrimSpace(b.String())
@@ -954,6 +939,52 @@ func buildCompactionSummary(parts []string, omittedCounts map[string]int) string
 		return summary
 	}
 	return strings.TrimSpace(summary[:responsesCompactSummaryMaxChars-3]) + "..."
+}
+
+func selectCompactionSummaryParts(parts []string, budget int) []string {
+	if budget <= 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(parts))
+	selected := make([]string, 0, len(parts))
+	used := 0
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := compactSnippet(parts[i])
+		if part == "" {
+			continue
+		}
+		if _, ok := seen[part]; ok {
+			continue
+		}
+		lineLen := len("- ") + len(part) + 1
+		if used+lineLen > budget {
+			continue
+		}
+		seen[part] = struct{}{}
+		selected = append(selected, part)
+		used += lineLen
+	}
+	slices.Reverse(selected)
+	return selected
+}
+
+func buildCompactionOmittedCountsSection(omittedCounts map[string]int) string {
+	if len(omittedCounts) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("Additional compacted items:")
+	keys := make([]string, 0, len(omittedCounts))
+	for key := range omittedCounts {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	for _, key := range keys {
+		b.WriteString(fmt.Sprintf(" %s=%d", key, omittedCounts[key]))
+	}
+	return b.String()
 }
 
 func compactSnippet(text string) string {

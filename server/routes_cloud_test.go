@@ -1707,6 +1707,30 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses summary selector keeps recent unique lines in order", func(t *testing.T) {
+		part1 := strings.Repeat("alpha ", 40)
+		part2 := strings.Repeat("beta ", 40)
+		part3 := strings.Repeat("gamma ", 40)
+		part4 := strings.Repeat("delta ", 40)
+
+		summary := buildCompactionSummary([]string{part1, part2, part2, part3, part4}, map[string]int{"tool": 2})
+		if !strings.Contains(summary, "Additional compacted items: tool=2") {
+			t.Fatalf("expected omitted counts to be preserved, got %q", summary)
+		}
+		if !strings.Contains(summary, compactSnippet(part4)) {
+			t.Fatalf("expected most recent distinct summary part to be kept, got %q", summary)
+		}
+		if !strings.Contains(summary, compactSnippet(part3)) {
+			t.Fatalf("expected next most recent distinct summary part to be kept, got %q", summary)
+		}
+		if strings.Count(summary, compactSnippet(part2)) > 1 {
+			t.Fatalf("expected duplicate summary parts to be deduped, got %q", summary)
+		}
+		if strings.Index(summary, compactSnippet(part3)) > strings.Index(summary, compactSnippet(part4)) {
+			t.Fatalf("expected selected summary parts to remain chronological, got %q", summary)
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
