@@ -98,6 +98,11 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 	for i := 0; i < len(compactedHead); i++ {
 		item := compactedHead[i]
 		itemType := normalizeResponsesItemType(item)
+		if combined, nextIndex, ok := summarizeCompactedToolExchangeWithAssistant(compactedHead, i); ok {
+			summaryParts = append(summaryParts, combined)
+			i = nextIndex
+			continue
+		}
 		if combined, nextIndex, ok := summarizeCompactedSameRoleMessageRun(compactedHead, i); ok {
 			summaryParts = append(summaryParts, combined)
 			i = nextIndex
@@ -291,6 +296,32 @@ func summarizeCompactedToolExchange(items []map[string]any, index int) (summary 
 	default:
 		return fmt.Sprintf("Tool %s executed", name), index + 1, true
 	}
+}
+
+func summarizeCompactedToolExchangeWithAssistant(items []map[string]any, index int) (summary string, nextIndex int, ok bool) {
+	toolSummary, nextIndex, ok := summarizeCompactedToolExchange(items, index)
+	if !ok {
+		return "", index, false
+	}
+	if nextIndex+1 >= len(items) {
+		return "", index, false
+	}
+
+	next := items[nextIndex+1]
+	if normalizeResponsesItemType(next) != "message" {
+		return "", index, false
+	}
+	role, _ := next["role"].(string)
+	if role != "assistant" {
+		return "", index, false
+	}
+
+	text := extractResponsesItemText(next["content"])
+	if text == "" {
+		return "", index, false
+	}
+
+	return fmt.Sprintf("%s | Assistant: %s", toolSummary, text), nextIndex + 1, true
 }
 
 func summarizeCompactedMessageRun(items []map[string]any, index int) (summary string, nextIndex int, ok bool) {
