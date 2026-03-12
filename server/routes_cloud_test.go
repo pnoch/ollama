@@ -1124,8 +1124,8 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if len(capture.body) >= cloudResponsesInputCompactMax {
 			t.Fatalf("expected compacted upstream body smaller than threshold, got %d bytes", len(capture.body))
 		}
-		if bytes.Count(capture.body, []byte(`"role":"user"`)) > responsesCompactKeepRecentUserMessages {
-			t.Fatalf("expected only recent user messages to remain, got %s", string(capture.body))
+		if bytes.Count(capture.body, []byte(`"type":"message"`)) > responsesCompactRecentTailMaxItems+1 {
+			t.Fatalf("expected compacted upstream body to preserve only a small recent tail plus summary, got %s", string(capture.body))
 		}
 		if !bytes.Contains(capture.body, []byte(`Previous conversation history was compacted by Ollama.`)) {
 			t.Fatalf("expected synthetic compacted summary, got %s", string(capture.body))
@@ -1190,18 +1190,21 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if payload.Model != "minimax-m2.5:cloud" {
 			t.Fatalf("expected aliased model in response, got %q", payload.Model)
 		}
-		if len(payload.Output) < 2 {
-			t.Fatalf("expected preserved history plus summary, got %+v", payload.Output)
+		if len(payload.Output) < 4 {
+			t.Fatalf("expected preserved compacted output, got %+v", payload.Output)
 		}
 		if payload.Output[0].Role != "system" || payload.Output[1].Role != "user" {
 			t.Fatalf("expected preserved system and user messages, got %+v", payload.Output)
 		}
-		last := payload.Output[len(payload.Output)-1]
-		if last.Role != "assistant" || len(last.Content) == 0 {
-			t.Fatalf("expected assistant summary message, got %+v", last)
-		}
 		if payload.Output[2].Role != "assistant" || payload.Output[2].Content[0].Text != "previous assistant answer" {
 			t.Fatalf("expected latest assistant message to be preserved, got %+v", payload.Output)
+		}
+		last := payload.Output[len(payload.Output)-1]
+		if last.Type == "function_call_output" {
+			return
+		}
+		if last.Role != "assistant" || len(last.Content) == 0 {
+			t.Fatalf("expected assistant summary message or preserved tool output, got %+v", last)
 		}
 		if !strings.Contains(last.Content[0].Text, "search result payload") {
 			t.Fatalf("expected summary to include tool output, got %q", last.Content[0].Text)
@@ -1274,8 +1277,10 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		reqBody := `{
 			"model":"minimax-m2.5:cloud",
 			"input":[
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"oldest assistant"}]},
 				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older assistant"}]},
 				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"latest assistant"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"older user"}]},
 				{"type":"message","role":"user","content":[{"type":"input_text","text":"latest user"}]}
 			]
 		}`
@@ -1300,14 +1305,65 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Contains(body, []byte(`"text":"latest assistant"`)) {
-			t.Fatalf("expected latest assistant message to remain, got %s", string(body))
+		if !bytes.Contains(body, []byte(`"text":"older assistant"`)) || !bytes.Contains(body, []byte(`"text":"latest assistant"`)) {
+			t.Fatalf("expected recent assistant tail to remain, got %s", string(body))
 		}
-		if bytes.Contains(body, []byte(`"text":"older assistant"`)) {
-			t.Fatalf("expected older assistant message to be compacted, got %s", string(body))
+		if bytes.Contains(body, []byte(`"text":"oldest assistant"`)) {
+			t.Fatalf("expected oldest assistant message to be compacted, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`Assistant: oldest assistant`)) {
+			t.Fatalf("expected oldest assistant message in summary, got %s", string(body))
+		}
+	})
+
+	t.Run("v1 responses compact preserves recent tool tail", func(t *testing.T) {
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{
+			"model":"minimax-m2.5:cloud",
+			"input":[
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older assistant"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"middle assistant"}]},
+				{"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"query\":\"recent\"}"},
+				{"type":"function_call_output","call_id":"call_1","output":"recent output"},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"latest user"}]}
+			]
+		}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses/compact", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(body, []byte(`"type":"function_call"`)) || !bytes.Contains(body, []byte(`"type":"function_call_output"`)) {
+			t.Fatalf("expected recent tool call pair to remain in compacted output, got %s", string(body))
 		}
 		if !bytes.Contains(body, []byte(`Assistant: older assistant`)) {
-			t.Fatalf("expected older assistant message in summary, got %s", string(body))
+			t.Fatalf("expected older assistant content to be summarized, got %s", string(body))
+		}
+		if !bytes.Contains(body, []byte(`"text":"middle assistant"`)) {
+			t.Fatalf("expected more recent assistant message to remain in tail, got %s", string(body))
 		}
 	})
 
