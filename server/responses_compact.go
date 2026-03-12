@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	responsesCompactKeepRecentUserMessages = 1
-	responsesCompactSummaryMaxChars        = 1200
+	responsesCompactKeepRecentUserMessages  = 1
+	responsesCompactKeepRecentAssistantMsgs = 1
+	responsesCompactSummaryMaxChars         = 1200
 )
 
 func (s *Server) ResponsesCompactHandler(c *gin.Context) {
@@ -78,6 +79,7 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 
 	systemAndDeveloper := make([]map[string]any, 0, len(items))
 	userMessages := make([]map[string]any, 0, len(items))
+	assistantMessages := make([]map[string]any, 0, len(items))
 	summaryParts := make([]string, 0, len(items))
 	omittedCounts := map[string]int{}
 
@@ -95,6 +97,11 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 			continue
 		}
 
+		if itemType == "message" && role == "assistant" {
+			assistantMessages = append(assistantMessages, item)
+			continue
+		}
+
 		summary := summarizeCompactedInputItem(itemType, item)
 		if summary != "" {
 			summaryParts = append(summaryParts, summary)
@@ -103,7 +110,7 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 		}
 	}
 
-	output := make([]map[string]any, 0, len(systemAndDeveloper)+len(userMessages)+1)
+	output := make([]map[string]any, 0, len(systemAndDeveloper)+len(userMessages)+len(assistantMessages)+1)
 	output = append(output, systemAndDeveloper...)
 
 	if len(userMessages) > responsesCompactKeepRecentUserMessages {
@@ -118,6 +125,19 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 		userMessages = userMessages[len(userMessages)-responsesCompactKeepRecentUserMessages:]
 	}
 	output = append(output, userMessages...)
+
+	if len(assistantMessages) > responsesCompactKeepRecentAssistantMsgs {
+		droppedAssistants := assistantMessages[:len(assistantMessages)-responsesCompactKeepRecentAssistantMsgs]
+		for _, item := range droppedAssistants {
+			if summary := summarizeCompactedInputItem("message", item); summary != "" {
+				summaryParts = append(summaryParts, summary)
+			} else {
+				omittedCounts["assistant_message"]++
+			}
+		}
+		assistantMessages = assistantMessages[len(assistantMessages)-responsesCompactKeepRecentAssistantMsgs:]
+	}
+	output = append(output, assistantMessages...)
 
 	if summaryText := buildCompactionSummary(summaryParts, omittedCounts); summaryText != "" {
 		output = append(output, makeResponsesAssistantMessage(summaryText))
