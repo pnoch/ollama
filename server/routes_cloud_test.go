@@ -1748,6 +1748,24 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses summary selector keeps category diversity under budget", func(t *testing.T) {
+		tool1 := "Tool search({\"query\":\"first\"}) -> first result"
+		tool2 := "Tool search({\"query\":\"second\"}) -> second result"
+		assistant := "Assistant: final recommendation"
+
+		budget := len("- ") + len(compactSnippet(tool2)) + 1 + len("- ") + len(compactSnippet(assistant)) + 1
+		selected := selectCompactionSummaryParts([]string{tool1, tool2, assistant}, budget)
+		if len(selected) != 2 {
+			t.Fatalf("expected two selected summary parts, got %+v", selected)
+		}
+		if selected[0] != compactSnippet(tool2) {
+			t.Fatalf("expected the more recent rich tool line to be kept, got %+v", selected)
+		}
+		if selected[1] != compactSnippet(assistant) {
+			t.Fatalf("expected category diversity to preserve assistant context, got %+v", selected)
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)

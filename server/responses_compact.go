@@ -950,6 +950,7 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 		text    string
 		index   int
 		score   int
+		kind    string
 		lineLen int
 	}
 
@@ -968,6 +969,7 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 			text:    part,
 			index:   i,
 			score:   scoreCompactionSummaryPart(part),
+			kind:    classifyCompactionSummaryPart(part),
 			lineLen: len("- ") + len(part) + 1,
 		})
 	}
@@ -989,12 +991,29 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 
 	selected := make([]summaryCandidate, 0, len(candidates))
 	used := 0
-	for _, candidate := range candidates {
-		if used+candidate.lineLen > budget {
-			continue
+	selectedKinds := make(map[string]int, 4)
+	remaining := append([]summaryCandidate(nil), candidates...)
+	for len(remaining) > 0 {
+		bestIndex := -1
+		bestEffective := 0
+		for i, candidate := range remaining {
+			if used+candidate.lineLen > budget {
+				continue
+			}
+			effective := candidate.score - selectedKinds[candidate.kind]*12
+			if bestIndex == -1 || effective > bestEffective || (effective == bestEffective && candidate.index > remaining[bestIndex].index) {
+				bestIndex = i
+				bestEffective = effective
+			}
 		}
-		selected = append(selected, candidate)
-		used += candidate.lineLen
+		if bestIndex == -1 {
+			break
+		}
+		chosen := remaining[bestIndex]
+		selected = append(selected, chosen)
+		selectedKinds[chosen.kind]++
+		used += chosen.lineLen
+		remaining = append(remaining[:bestIndex], remaining[bestIndex+1:]...)
 	}
 
 	slices.SortFunc(selected, func(a, b summaryCandidate) int {
@@ -1050,6 +1069,25 @@ func scoreCompactionSummaryPart(part string) int {
 	}
 	score += min(len(part)/24, 10)
 	return score
+}
+
+func classifyCompactionSummaryPart(part string) string {
+	switch {
+	case strings.Contains(part, " | Tool ") && strings.Contains(part, " | Assistant:"):
+		return "user_tool_assistant"
+	case strings.Contains(part, "Tool ") && strings.Contains(part, "->"):
+		return "tool_exchange"
+	case strings.Contains(part, "User:") && strings.Contains(part, "Assistant:"):
+		return "message_pair"
+	case strings.Contains(part, "Assistant:"):
+		return "assistant"
+	case strings.Contains(part, "User:"):
+		return "user"
+	case strings.Contains(part, "Tool call ") || strings.Contains(part, "Tool output:"):
+		return "tool"
+	default:
+		return "other"
+	}
 }
 
 func compactSnippet(text string) string {
