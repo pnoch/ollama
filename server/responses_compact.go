@@ -1178,6 +1178,14 @@ trimmed:
 			part = strings.TrimSpace(part[1 : len(part)-1])
 		}
 	}
+	if len(part) >= 2 {
+		switch {
+		case strings.HasPrefix(part, `"`) && strings.HasSuffix(part, `"`):
+			part = strings.TrimSpace(part[1 : len(part)-1])
+		case strings.HasPrefix(part, `'`) && strings.HasSuffix(part, `'`):
+			part = strings.TrimSpace(part[1 : len(part)-1])
+		}
+	}
 	part = strings.TrimSpace(strings.TrimRight(part, " .,!?:;"))
 	return part
 }

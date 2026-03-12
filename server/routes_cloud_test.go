@@ -1398,6 +1398,78 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses round-trip normalization preserves planted continuity facts", func(t *testing.T) {
+		items := []map[string]any{
+			makeResponsesInputMessage("user", "project=nebula ticket=RAVEN-27"),
+			makeResponsesAssistantMessage("owner=Iris checksum=84219"),
+			{
+				"type":      "custom_tool_call",
+				"call_id":   "call_release",
+				"name":      "search",
+				"input":     `{"query":"nebula release status"}`,
+				"status":    "completed",
+				"extra_key": "ignored",
+			},
+			{
+				"type":    "custom_tool_call_output",
+				"call_id": "call_release",
+				"output":  "release status=shipped",
+			},
+			makeResponsesAssistantMessage("release status=shipped"),
+			{
+				"type":   "web_search_call",
+				"status": "completed",
+				"action": map[string]any{"type": "search", "query": "nebula release status"},
+			},
+		}
+		for i := 0; i < 18; i++ {
+			items = append(items,
+				makeResponsesInputMessage("user", fmt.Sprintf("filler-user-%02d %s", i, strings.Repeat("context ", 90))),
+				makeResponsesAssistantMessage(fmt.Sprintf("filler-assistant-%02d %s", i, strings.Repeat("reply ", 90))),
+			)
+		}
+		items = append(items,
+			makeResponsesInputMessage("user", "recent-marker=phoenix"),
+			makeResponsesAssistantMessage("recent-status=active"),
+		)
+
+		raw, err := json.Marshal(items)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		first, err := normalizeCloudResponsesInput(raw, "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := normalizeCloudResponsesInput(first, "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, fact := range []string{
+			"project=nebula",
+			"ticket=RAVEN-27",
+			"owner=Iris",
+			"checksum=84219",
+			"release status=shipped",
+			"recent-marker=phoenix",
+			"recent-status=active",
+		} {
+			if !bytes.Contains(second, []byte(fact)) {
+				t.Fatalf("expected round-trip normalized history to retain %q, got %s", fact, string(second))
+			}
+		}
+		for _, dropped := range []string{`"type":"custom_tool_call"`, `"type":"custom_tool_call_output"`, `"type":"web_search_call"`, `"type":"compaction"`} {
+			if bytes.Contains(second, []byte(dropped)) {
+				t.Fatalf("expected round-trip normalized history to drop %s, got %s", dropped, string(second))
+			}
+		}
+		if !bytes.Contains(second, []byte(`"type":"function_call"`)) || !bytes.Contains(second, []byte(`"type":"function_call_output"`)) {
+			t.Fatalf("expected structured tool history to survive normalization, got %s", string(second))
+		}
+	})
+
 	t.Run("v1 responses compaction preserves one older structured tool exchange", func(t *testing.T) {
 		raw := json.RawMessage(`[
 			{"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"query\":\"older docs\"}"},
@@ -1864,6 +1936,20 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 		if selected[0] != compactSnippet(plain) || selected[1] != compactSnippet(tool) {
 			t.Fatalf("expected wrapper-normalized variants to survive, got %+v", selected)
+		}
+	})
+
+	t.Run("v1 responses summary selector ignores whole-payload quote wrappers", func(t *testing.T) {
+		quoted := "Assistant: \"fix shipped in 0.17.7\""
+		plain := "Assistant: fix shipped in 0.17.7"
+		tool := "Tool search({\"query\":\"release note\"}) -> fix shipped in 0.17.7"
+
+		selected := selectCompactionSummaryParts([]string{quoted, plain, tool}, 1000)
+		if len(selected) != 2 {
+			t.Fatalf("expected whole-payload quote wrapper variant to be deduped, got %+v", selected)
+		}
+		if selected[0] != compactSnippet(plain) || selected[1] != compactSnippet(tool) {
+			t.Fatalf("expected quote-wrapper-normalized variants to survive, got %+v", selected)
 		}
 	})
 
