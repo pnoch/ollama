@@ -1138,11 +1138,28 @@ func normalizeCompactionSummaryPart(part string) string {
 	}
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(part, prefix) {
-			return strings.TrimSpace(strings.TrimPrefix(part, prefix))
+			part = strings.TrimSpace(strings.TrimPrefix(part, prefix))
+			goto trimmed
 		}
 	}
 	if strings.HasPrefix(part, "Tool ") {
-		return strings.TrimSpace(strings.TrimPrefix(part, "Tool "))
+		part = strings.TrimSpace(strings.TrimPrefix(part, "Tool "))
+	}
+trimmed:
+	leadIns := []string{
+		"confirmed ",
+		"confirming ",
+		"noted ",
+		"noting ",
+		"result: ",
+		"summary: ",
+	}
+	lower := strings.ToLower(part)
+	for _, leadIn := range leadIns {
+		if strings.HasPrefix(lower, leadIn) {
+			part = strings.TrimSpace(part[len(leadIn):])
+			break
+		}
 	}
 	return part
 }
