@@ -35,8 +35,9 @@ const (
 	// maxDecompressedBodySize limits the size of a decompressed request body
 	maxDecompressedBodySize = 20 << 20
 
-	cloudRequestedModelAliasKey = "cloud_requested_model_alias"
-	cloudRequestedModelBaseKey  = "cloud_requested_model_base"
+	cloudRequestedModelAliasKey   = "cloud_requested_model_alias"
+	cloudRequestedModelBaseKey    = "cloud_requested_model_base"
+	cloudResponsesInputCompactMax = 12000
 )
 
 var (
@@ -292,7 +293,112 @@ func replaceJSONModelField(body []byte, model string) ([]byte, error) {
 	}
 	payload["model"] = modelJSON
 
+	if rawInput, ok := payload["input"]; ok {
+		normalizedInput, err := normalizeCloudResponsesInput(rawInput)
+		if err != nil {
+			return nil, err
+		}
+		payload["input"] = normalizedInput
+	}
+
 	return json.Marshal(payload)
+}
+
+func normalizeCloudResponsesInput(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return raw, nil
+	}
+
+	var items []map[string]any
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return raw, nil
+	}
+
+	normalized := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		expanded, err := normalizeCloudResponsesInputItem(item)
+		if err != nil {
+			return nil, err
+		}
+		normalized = append(normalized, expanded...)
+	}
+
+	normalizedJSON, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(normalizedJSON) <= cloudResponsesInputCompactMax {
+		return normalizedJSON, nil
+	}
+
+	compacted, err := compactResponsesInput(normalizedJSON)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(compacted)
+}
+
+func normalizeCloudResponsesInputItem(item map[string]any) ([]map[string]any, error) {
+	itemType, _ := item["type"].(string)
+	switch itemType {
+	case "custom_tool_call":
+		item["type"] = "function_call"
+		item["arguments"] = normalizeCloudToolArguments(item["input"])
+		delete(item, "input")
+		delete(item, "status")
+		return []map[string]any{item}, nil
+	case "custom_tool_call_output":
+		item["type"] = "function_call_output"
+		return []map[string]any{item}, nil
+	case "compaction":
+		replacementHistory, _ := item["replacement_history"].([]any)
+		if len(replacementHistory) == 0 {
+			return nil, nil
+		}
+		expanded := make([]map[string]any, 0, len(replacementHistory))
+		for _, rawReplacement := range replacementHistory {
+			replacement, _ := rawReplacement.(map[string]any)
+			if replacement == nil {
+				continue
+			}
+			normalizedReplacement, err := normalizeCloudResponsesInputItem(replacement)
+			if err != nil {
+				return nil, err
+			}
+			expanded = append(expanded, normalizedReplacement...)
+		}
+		return expanded, nil
+	case "web_search_call":
+		return nil, nil
+	default:
+		return []map[string]any{item}, nil
+	}
+}
+
+func normalizeCloudToolArguments(value any) string {
+	switch typed := value.(type) {
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return "{}"
+		}
+		var decoded any
+		if json.Unmarshal([]byte(trimmed), &decoded) == nil {
+			return trimmed
+		}
+		wrapped, err := json.Marshal(map[string]string{"input": typed})
+		if err == nil {
+			return string(wrapped)
+		}
+		return `{}`
+	default:
+		encoded, err := json.Marshal(map[string]any{"input": typed})
+		if err == nil {
+			return string(encoded)
+		}
+		return `{}`
+	}
 }
 
 func readRequestBody(r *http.Request) ([]byte, error) {
