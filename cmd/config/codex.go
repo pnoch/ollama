@@ -366,8 +366,8 @@ func codexModelCatalogArg(model string) (string, func(), error) {
 	entry["upgrade"] = nil
 	entry["context_window"] = limit.Context
 	entry["effective_context_window_percent"] = 95
-	entry["auto_compact_token_limit"] = limit.Context * 95 / 100
 	entry["prefer_websockets"] = false
+	delete(entry, "auto_compact_token_limit")
 
 	catalog.Models = append(catalog.Models, entry)
 
