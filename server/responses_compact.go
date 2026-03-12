@@ -1161,6 +1161,7 @@ trimmed:
 			break
 		}
 	}
+	part = strings.TrimSpace(strings.TrimRight(part, " .,!?:;"))
 	return part
 }
 
