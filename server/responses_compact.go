@@ -103,11 +103,21 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 
 	chunkMax, charMax := responsesCompactTailBudget(model)
 	preservedTail, compactedHead := splitCompactedTailWithBudget(otherItems, chunkMax, charMax)
+	if structured, newTail, newHead, ok := extractBoundaryStructuredMessagePair(compactedHead, preservedTail, model); ok {
+		structuredPreserved = append(structuredPreserved, structured...)
+		preservedTail = newTail
+		compactedHead = newHead
+	}
 	for i := 0; i < len(compactedHead); i++ {
 		item := compactedHead[i]
 		itemType := normalizeResponsesItemType(item)
 		if len(structuredPreserved) == 0 {
 			if structured, nextIndex, ok := extractStructuredCompactedToolExchange(compactedHead, i); ok {
+				structuredPreserved = append(structuredPreserved, structured...)
+				i = nextIndex
+				continue
+			}
+			if structured, nextIndex, ok := extractStructuredCompactedMessagePair(compactedHead, i, model); ok {
 				structuredPreserved = append(structuredPreserved, structured...)
 				i = nextIndex
 				continue
@@ -358,6 +368,62 @@ func extractStructuredCompactedToolExchange(items []map[string]any, index int) (
 	}
 
 	return []map[string]any{item, next}, index + 1, true
+}
+
+func extractStructuredCompactedMessagePair(items []map[string]any, index int, model string) (structured []map[string]any, nextIndex int, ok bool) {
+	if !allowsStructuredCompactedMessagePair(model) {
+		return nil, index, false
+	}
+	if index+1 >= len(items) {
+		return nil, index, false
+	}
+
+	item := items[index]
+	next := items[index+1]
+	if normalizeResponsesItemType(item) != "message" || normalizeResponsesItemType(next) != "message" {
+		return nil, index, false
+	}
+
+	role, _ := item["role"].(string)
+	nextRole, _ := next["role"].(string)
+	if role != "user" || nextRole != "assistant" {
+		return nil, index, false
+	}
+	if extractResponsesItemText(item["content"]) == "" || extractResponsesItemText(next["content"]) == "" {
+		return nil, index, false
+	}
+
+	return []map[string]any{item, next}, index + 1, true
+}
+
+func extractBoundaryStructuredMessagePair(compactedHead, preservedTail []map[string]any, model string) (structured, newTail, newHead []map[string]any, ok bool) {
+	if !allowsStructuredCompactedMessagePair(model) {
+		return nil, preservedTail, compactedHead, false
+	}
+	if len(compactedHead) == 0 || len(preservedTail) == 0 {
+		return nil, preservedTail, compactedHead, false
+	}
+
+	lastHead := compactedHead[len(compactedHead)-1]
+	firstTail := preservedTail[0]
+	if normalizeResponsesItemType(lastHead) != "message" || normalizeResponsesItemType(firstTail) != "message" {
+		return nil, preservedTail, compactedHead, false
+	}
+	role, _ := lastHead["role"].(string)
+	nextRole, _ := firstTail["role"].(string)
+	if role != "user" || nextRole != "assistant" {
+		return nil, preservedTail, compactedHead, false
+	}
+	if extractResponsesItemText(lastHead["content"]) == "" || extractResponsesItemText(firstTail["content"]) == "" {
+		return nil, preservedTail, compactedHead, false
+	}
+
+	return []map[string]any{lastHead, firstTail}, preservedTail[1:], compactedHead[:len(compactedHead)-1], true
+}
+
+func allowsStructuredCompactedMessagePair(model string) bool {
+	limit, ok := lookupCloudModelLimit(model)
+	return ok && limit.Context >= 200_000
 }
 
 func summarizeCompactedToolExchangeWithAssistant(items []map[string]any, index int) (summary string, nextIndex int, ok bool) {
