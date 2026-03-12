@@ -1620,6 +1620,38 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses preserved structured chunks stay chronological", func(t *testing.T) {
+		raw := json.RawMessage(`[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"older question"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older answer"}]},
+			{"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"query\":\"middle docs\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"middle result"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"middle explanation"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 1"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 2"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 3"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 4"}]}
+		]`)
+
+		output, err := compactResponsesInputForModel(raw, "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		olderIdx := bytes.Index(body, []byte(`older answer`))
+		middleIdx := bytes.Index(body, []byte(`middle result`))
+		if olderIdx == -1 || middleIdx == -1 {
+			t.Fatalf("expected both structured chunks in output, got %s", string(body))
+		}
+		if olderIdx > middleIdx {
+			t.Fatalf("expected structured chunks to remain chronological, got %s", string(body))
+		}
+	})
+
 	t.Run("v1 responses compact drops older user messages", func(t *testing.T) {
 		s := &Server{}
 		router, err := s.GenerateRoutes(nil)
