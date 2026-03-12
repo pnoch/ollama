@@ -13,9 +13,9 @@ import (
 )
 
 const (
-	responsesCompactKeepRecentUserMessages  = 1
-	responsesCompactKeepRecentAssistantMsgs = 1
-	responsesCompactSummaryMaxChars         = 1200
+	responsesCompactRecentTailMaxItems = 4
+	responsesCompactRecentTailMaxChars = 1600
+	responsesCompactSummaryMaxChars    = 1200
 )
 
 func (s *Server) ResponsesCompactHandler(c *gin.Context) {
@@ -78,8 +78,7 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 	}
 
 	systemAndDeveloper := make([]map[string]any, 0, len(items))
-	userMessages := make([]map[string]any, 0, len(items))
-	assistantMessages := make([]map[string]any, 0, len(items))
+	otherItems := make([]map[string]any, 0, len(items))
 	summaryParts := make([]string, 0, len(items))
 	omittedCounts := map[string]int{}
 
@@ -92,52 +91,21 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 			continue
 		}
 
-		if itemType == "message" && role == "user" {
-			userMessages = append(userMessages, item)
-			continue
-		}
+		otherItems = append(otherItems, item)
+	}
 
-		if itemType == "message" && role == "assistant" {
-			assistantMessages = append(assistantMessages, item)
-			continue
-		}
-
-		summary := summarizeCompactedInputItem(itemType, item)
-		if summary != "" {
+	preservedTail, compactedHead := splitCompactedTail(otherItems)
+	for _, item := range compactedHead {
+		if summary := summarizeCompactedInputItem(normalizeResponsesItemType(item), item); summary != "" {
 			summaryParts = append(summaryParts, summary)
 		} else {
-			omittedCounts[itemType]++
+			omittedCounts[normalizeResponsesItemType(item)]++
 		}
 	}
 
-	output := make([]map[string]any, 0, len(systemAndDeveloper)+len(userMessages)+len(assistantMessages)+1)
+	output := make([]map[string]any, 0, len(systemAndDeveloper)+len(preservedTail)+1)
 	output = append(output, systemAndDeveloper...)
-
-	if len(userMessages) > responsesCompactKeepRecentUserMessages {
-		droppedUsers := userMessages[:len(userMessages)-responsesCompactKeepRecentUserMessages]
-		for _, item := range droppedUsers {
-			if summary := summarizeCompactedInputItem("message", item); summary != "" {
-				summaryParts = append(summaryParts, summary)
-			} else {
-				omittedCounts["user_message"]++
-			}
-		}
-		userMessages = userMessages[len(userMessages)-responsesCompactKeepRecentUserMessages:]
-	}
-	output = append(output, userMessages...)
-
-	if len(assistantMessages) > responsesCompactKeepRecentAssistantMsgs {
-		droppedAssistants := assistantMessages[:len(assistantMessages)-responsesCompactKeepRecentAssistantMsgs]
-		for _, item := range droppedAssistants {
-			if summary := summarizeCompactedInputItem("message", item); summary != "" {
-				summaryParts = append(summaryParts, summary)
-			} else {
-				omittedCounts["assistant_message"]++
-			}
-		}
-		assistantMessages = assistantMessages[len(assistantMessages)-responsesCompactKeepRecentAssistantMsgs:]
-	}
-	output = append(output, assistantMessages...)
+	output = append(output, preservedTail...)
 
 	if summaryText := buildCompactionSummary(summaryParts, omittedCounts); summaryText != "" {
 		output = append(output, makeResponsesAssistantMessage(summaryText))
@@ -148,6 +116,32 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 	}
 
 	return output, nil
+}
+
+func splitCompactedTail(items []map[string]any) (preservedTail []map[string]any, compactedHead []map[string]any) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	start := len(items)
+	size := 0
+	for start > 0 {
+		candidate := items[start-1]
+		candidateJSON, err := json.Marshal(candidate)
+		if err != nil {
+			break
+		}
+		if len(items)-start >= responsesCompactRecentTailMaxItems {
+			break
+		}
+		if size+len(candidateJSON) > responsesCompactRecentTailMaxChars {
+			break
+		}
+		start--
+		size += len(candidateJSON)
+	}
+
+	return items[start:], items[:start]
 }
 
 func normalizeResponsesItemType(item map[string]any) string {
