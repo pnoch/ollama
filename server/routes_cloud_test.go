@@ -1426,6 +1426,43 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses compaction preserves older structured tool exchange with assistant for larger models", func(t *testing.T) {
+		raw := json.RawMessage(`[
+			{"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"query\":\"older docs\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"older result"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older explanation"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 1"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 2"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent 3"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent 4"}]}
+		]`)
+
+		largeOutput, err := compactResponsesInputForModel(raw, "minimax-m2.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		smallOutput, err := compactResponsesInputForModel(raw, "gpt-oss:20b")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		largeJSON, err := json.Marshal(largeOutput)
+		if err != nil {
+			t.Fatal(err)
+		}
+		smallJSON, err := json.Marshal(smallOutput)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !bytes.Contains(largeJSON, []byte(`"type":"function_call"`)) || !bytes.Contains(largeJSON, []byte(`"type":"function_call_output"`)) || !bytes.Contains(largeJSON, []byte(`"text":"older explanation"`)) {
+			t.Fatalf("expected larger-context model to preserve older structured tool triple, got %s", string(largeJSON))
+		}
+		if bytes.Contains(smallJSON, []byte(`"type":"function_call"`)) && bytes.Contains(smallJSON, []byte(`"text":"older explanation"`)) {
+			t.Fatalf("expected smaller-context model to summarize at least part of the older tool triple, got %s", string(smallJSON))
+		}
+	})
+
 	t.Run("v1 responses compaction preserves one older structured message pair for larger models", func(t *testing.T) {
 		raw := json.RawMessage(`[
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"older question"}]},
