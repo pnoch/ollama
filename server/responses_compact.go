@@ -13,9 +13,9 @@ import (
 )
 
 const (
-	responsesCompactRecentTailMaxItems = 4
-	responsesCompactRecentTailMaxChars = 1600
-	responsesCompactSummaryMaxChars    = 1200
+	responsesCompactRecentTailMaxChunks = 3
+	responsesCompactRecentTailMaxChars  = 1600
+	responsesCompactSummaryMaxChars     = 1200
 )
 
 func (s *Server) ResponsesCompactHandler(c *gin.Context) {
@@ -123,25 +123,59 @@ func splitCompactedTail(items []map[string]any) (preservedTail []map[string]any,
 		return nil, nil
 	}
 
-	start := len(items)
+	chunks := buildResponsesCompactionChunks(items)
+	startChunk := len(chunks)
 	size := 0
-	for start > 0 {
-		candidate := items[start-1]
+	for startChunk > 0 {
+		candidate := chunks[startChunk-1]
 		candidateJSON, err := json.Marshal(candidate)
 		if err != nil {
 			break
 		}
-		if len(items)-start >= responsesCompactRecentTailMaxItems {
+		if len(chunks)-startChunk >= responsesCompactRecentTailMaxChunks {
 			break
 		}
 		if size+len(candidateJSON) > responsesCompactRecentTailMaxChars {
 			break
 		}
-		start--
+		startChunk--
 		size += len(candidateJSON)
 	}
 
-	return items[start:], items[:start]
+	startItem := 0
+	for i := 0; i < startChunk; i++ {
+		startItem += len(chunks[i])
+	}
+
+	return items[startItem:], items[:startItem]
+}
+
+func buildResponsesCompactionChunks(items []map[string]any) [][]map[string]any {
+	chunks := make([][]map[string]any, 0, len(items))
+	for i := 0; i < len(items); i++ {
+		item := items[i]
+		itemType := normalizeResponsesItemType(item)
+
+		if itemType == "function_call" || itemType == "custom_tool_call" {
+			chunk := []map[string]any{item}
+			if i+1 < len(items) {
+				next := items[i+1]
+				nextType := normalizeResponsesItemType(next)
+				callID, _ := item["call_id"].(string)
+				nextCallID, _ := next["call_id"].(string)
+				if (nextType == "function_call_output" || nextType == "custom_tool_call_output") && callID != "" && callID == nextCallID {
+					chunk = append(chunk, next)
+					i++
+				}
+			}
+			chunks = append(chunks, chunk)
+			continue
+		}
+
+		chunks = append(chunks, []map[string]any{item})
+	}
+
+	return chunks
 }
 
 func normalizeResponsesItemType(item map[string]any) string {
