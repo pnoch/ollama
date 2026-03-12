@@ -1373,6 +1373,52 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		}
 	})
 
+	t.Run("v1 responses compact combines older tool exchange summary", func(t *testing.T) {
+		s := &Server{}
+		router, err := s.GenerateRoutes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := httptest.NewServer(router)
+		defer local.Close()
+
+		reqBody := `{
+			"model":"minimax-m2.5:cloud",
+			"input":[
+				{"type":"function_call","call_id":"call_old","name":"search","arguments":"{\"query\":\"archived\"}"},
+				{"type":"function_call_output","call_id":"call_old","output":"archived output"},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent assistant"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"recent user"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"newest assistant"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"newest user"}]}
+			]
+		}`
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, local.URL+"/v1/responses/compact", bytes.NewBufferString(reqBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := local.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(body, []byte(`Tool search({\"query\":\"archived\"})`)) || !bytes.Contains(body, []byte(`archived output`)) {
+			t.Fatalf("expected older tool exchange to be summarized as one line, got %s", string(body))
+		}
+	})
+
 	t.Run("v1 responses strips encrypted content from event stream", func(t *testing.T) {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")

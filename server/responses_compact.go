@@ -95,11 +95,18 @@ func compactResponsesInput(raw json.RawMessage) ([]map[string]any, error) {
 	}
 
 	preservedTail, compactedHead := splitCompactedTail(otherItems)
-	for _, item := range compactedHead {
-		if summary := summarizeCompactedInputItem(normalizeResponsesItemType(item), item); summary != "" {
+	for i := 0; i < len(compactedHead); i++ {
+		item := compactedHead[i]
+		itemType := normalizeResponsesItemType(item)
+		if combined, nextIndex, ok := summarizeCompactedToolExchange(compactedHead, i); ok {
+			summaryParts = append(summaryParts, combined)
+			i = nextIndex
+			continue
+		}
+		if summary := summarizeCompactedInputItem(itemType, item); summary != "" {
 			summaryParts = append(summaryParts, summary)
 		} else {
-			omittedCounts[normalizeResponsesItemType(item)]++
+			omittedCounts[itemType]++
 		}
 	}
 
@@ -233,6 +240,46 @@ func summarizeCompactedInputItem(itemType string, item map[string]any) string {
 		return ""
 	default:
 		return ""
+	}
+}
+
+func summarizeCompactedToolExchange(items []map[string]any, index int) (summary string, nextIndex int, ok bool) {
+	item := items[index]
+	itemType := normalizeResponsesItemType(item)
+	if itemType != "function_call" && itemType != "custom_tool_call" {
+		return "", index, false
+	}
+	if index+1 >= len(items) {
+		return "", index, false
+	}
+
+	next := items[index+1]
+	nextType := normalizeResponsesItemType(next)
+	if nextType != "function_call_output" && nextType != "custom_tool_call_output" {
+		return "", index, false
+	}
+
+	callID, _ := item["call_id"].(string)
+	nextCallID, _ := next["call_id"].(string)
+	if callID == "" || callID != nextCallID {
+		return "", index, false
+	}
+
+	name, _ := item["name"].(string)
+	args := compactSnippet(stringValue(item["arguments"]))
+	if args == "" {
+		args = compactSnippet(stringValue(item["input"]))
+	}
+	output := compactSnippet(stringValue(next["output"]))
+	switch {
+	case args != "" && output != "":
+		return fmt.Sprintf("Tool %s(%s) -> %s", name, args, output), index + 1, true
+	case output != "":
+		return fmt.Sprintf("Tool %s -> %s", name, output), index + 1, true
+	case args != "":
+		return fmt.Sprintf("Tool %s(%s)", name, args), index + 1, true
+	default:
+		return fmt.Sprintf("Tool %s executed", name), index + 1, true
 	}
 }
 
