@@ -1268,6 +1268,7 @@ func (c *ResponsesStreamConverter) processTextContent(content string) []Response
 				"type":    "message",
 				"status":  "in_progress",
 				"role":    "assistant",
+				"phase":   "final_answer",
 				"content": []any{},
 			},
 		}))
@@ -1325,6 +1326,7 @@ func (c *ResponsesStreamConverter) buildFinalOutput() []any {
 			"type":   "message",
 			"status": "completed",
 			"role":   "assistant",
+			"phase":  "final_answer",
 			"content": []map[string]any{{
 				"type":        "output_text",
 				"text":        c.accumulatedText,
@@ -1375,6 +1377,7 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 				"type":   "message",
 				"status": "completed",
 				"role":   "assistant",
+				"phase":  "final_answer",
 				"content": []map[string]any{{
 					"type":        "output_text",
 					"text":        c.accumulatedText,

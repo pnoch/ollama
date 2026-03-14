@@ -44,6 +44,30 @@ func TestParseToolChoice_NamedFunction(t *testing.T) {
 	}
 }
 
+func TestParseToolChoice_NamedFunction_FlatForm(t *testing.T) {
+	// Responses API flat form: {"type":"function","name":"X"}
+	raw := json.RawMessage(`{"type":"function","name":"my_tool"}`)
+	got := ParseToolChoice(raw)
+	if got.Kind != ToolChoiceNamed {
+		t.Errorf("expected ToolChoiceNamed for flat form, got %v", got.Kind)
+	}
+	if got.FuncName != "my_tool" {
+		t.Errorf("expected FuncName=my_tool, got %q", got.FuncName)
+	}
+}
+
+func TestParseToolChoice_NamedFunction_NestedFormTakesPrecedence(t *testing.T) {
+	// When both name fields are present, nested form wins
+	raw := json.RawMessage(`{"type":"function","name":"flat_name","function":{"name":"nested_name"}}`)
+	got := ParseToolChoice(raw)
+	if got.Kind != ToolChoiceNamed {
+		t.Errorf("expected ToolChoiceNamed, got %v", got.Kind)
+	}
+	if got.FuncName != "nested_name" {
+		t.Errorf("expected FuncName=nested_name (nested wins), got %q", got.FuncName)
+	}
+}
+
 func TestParseToolChoice_MalformedObject(t *testing.T) {
 	// object without the expected fields → auto
 	raw := json.RawMessage(`{"type":"unknown"}`)

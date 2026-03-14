@@ -15,7 +15,7 @@ const (
 	ToolChoiceAuto     ToolChoiceKind = iota // "auto" or unset
 	ToolChoiceNone                           // "none"
 	ToolChoiceRequired                       // "required"
-	ToolChoiceNamed                          // {"type":"function","function":{"name":"X"}}
+	ToolChoiceNamed                          // {"type":"function","name":"X"} or {"type":"function","function":{"name":"X"}}
 )
 
 // ParsedToolChoice holds the result of parsing a raw tool_choice JSON value.
@@ -42,15 +42,26 @@ func ParseToolChoice(raw json.RawMessage) ParsedToolChoice {
 			return ParsedToolChoice{Kind: ToolChoiceAuto}
 		}
 	}
-	// Try object form: {"type":"function","function":{"name":"X"}}
+	// Try both object forms:
+	//   Responses API (flat):  {"type":"function","name":"X"}
+	//   Chat API (nested):     {"type":"function","function":{"name":"X"}}
+	// The nested form takes precedence when both name fields are present.
 	var obj struct {
 		Type     string `json:"type"`
+		Name     string `json:"name"`     // Responses API flat form
 		Function struct {
 			Name string `json:"name"`
-		} `json:"function"`
+		} `json:"function"` // Chat API nested form
 	}
-	if err := json.Unmarshal(raw, &obj); err == nil && obj.Type == "function" && obj.Function.Name != "" {
-		return ParsedToolChoice{Kind: ToolChoiceNamed, FuncName: obj.Function.Name}
+	if err := json.Unmarshal(raw, &obj); err == nil && obj.Type == "function" {
+		if obj.Function.Name != "" {
+			// Chat API nested form: {"type":"function","function":{"name":"X"}}
+			return ParsedToolChoice{Kind: ToolChoiceNamed, FuncName: obj.Function.Name}
+		}
+		if obj.Name != "" {
+			// Responses API flat form: {"type":"function","name":"X"}
+			return ParsedToolChoice{Kind: ToolChoiceNamed, FuncName: obj.Name}
+		}
 	}
 	return ParsedToolChoice{Kind: ToolChoiceAuto}
 }
