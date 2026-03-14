@@ -182,12 +182,14 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 		}
 	}
 	output = append(output, structuredPreserved...)
-	output = append(output, preservedTail...)
-
+	// Insert the compaction summary BEFORE preservedTail so that the most
+	// recent real messages remain the last thing the model sees. Placing the
+	// summary after preservedTail caused the model to treat the summary as
+	// the latest assistant turn and lose track of the active task.
 	if summaryText := buildCompactionSummary(summaryParts, omittedCounts); summaryText != "" {
 		output = append(output, makeResponsesAssistantMessage(summaryText))
 	}
-
+	output = append(output, preservedTail...)
 	if len(output) == 0 {
 		output = append(output, makeResponsesAssistantMessage("Previous conversation history was compacted by Ollama."))
 	}
