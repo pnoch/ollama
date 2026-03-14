@@ -540,6 +540,14 @@ func ResponsesMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		// background mode is not supported for local models; return a clear error
+		// rather than silently ignoring the flag and running synchronously.
+		if req.Background {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest,
+				"background mode is not supported for local models; use a cloud model or omit the background field"))
+			return
+		}
+
 		chatReq, err := openai.FromResponsesRequest(req)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))

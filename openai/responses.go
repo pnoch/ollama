@@ -380,9 +380,11 @@ type ResponsesRequest struct {
 
 	Tools []ResponsesTool `json:"tools,omitempty"`
 
-	// TODO(drifkin): tool_choice is not supported. We could support "none" by not
-	// passing tools, but the other controls like `"required"` cannot be generally
-	// supported.
+	// optional: "auto" | "none" | "required" | {type: "function", name: string}
+	// "none"     → strip all tools from the chat request
+	// "required" → append a system prompt suffix instructing the model to call a tool
+	// other      → passed through as-is (best-effort)
+	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
 
 	// optional, default is false
 	Stream *bool `json:"stream,omitempty"`
@@ -539,14 +541,44 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 		options["num_predict"] = *r.MaxOutputTokens
 	}
 
+	// Parse tool_choice to determine how to handle tools.
+	// Supported values:
+	//   "none"     → strip all tools so the model cannot call any
+	//   "required" → inject a system suffix instructing the model to call a tool
+	//   anything else ("auto", named function, etc.) → no special handling
+	toolChoiceStr := ""
+	if len(r.ToolChoice) > 0 {
+		// ToolChoice can be a plain string or an object {type, name}.
+		// Try plain string first.
+		_ = json.Unmarshal(r.ToolChoice, &toolChoiceStr)
+	}
+
 	// Convert tools from Responses API format to api.Tool format
 	var tools []api.Tool
-	for _, t := range r.Tools {
-		tool, err := convertTool(t)
-		if err != nil {
-			return nil, err
+	if toolChoiceStr != "none" {
+		for _, t := range r.Tools {
+			tool, err := convertTool(t)
+			if err != nil {
+				return nil, err
+			}
+			tools = append(tools, tool)
 		}
-		tools = append(tools, tool)
+	}
+	// When tool_choice is "required", append a system message suffix that
+	// instructs the model to always respond by calling one of the provided
+	// tools. This is a best-effort approximation for local models that do not
+	// natively support tool_choice enforcement.
+	if toolChoiceStr == "required" && len(tools) > 0 {
+		suffix := api.Message{
+			Role:    "system",
+			Content: "You must respond by calling one of the provided tools. Do not reply with plain text.",
+		}
+		// Insert after any existing system/developer messages at the front.
+		insertAt := 0
+		for insertAt < len(messages) && (messages[insertAt].Role == "system" || messages[insertAt].Role == "developer") {
+			insertAt++
+		}
+		messages = append(messages[:insertAt], append([]api.Message{suffix}, messages[insertAt:]...)...)
 	}
 
 	// Handle text format (e.g. json_schema)
@@ -818,15 +850,22 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 		text.Format = *request.Text.Format
 	}
 
-	// Build reasoning output from request
+	// Build reasoning output from request.
+	// If the local model produced thinking output but the request did not
+	// specify a reasoning.summary preference, default to "concise" so that
+	// Codex CLI surfaces the reasoning block rather than hiding it.
 	var reasoning *ResponsesReasoningOutput
-	if request.Reasoning.Effort != "" || request.Reasoning.Summary != "" {
+	effectiveSummary := request.Reasoning.Summary
+	if chatResponse.Message.Thinking != "" && effectiveSummary == "" {
+		effectiveSummary = "concise"
+	}
+	if request.Reasoning.Effort != "" || effectiveSummary != "" {
 		reasoning = &ResponsesReasoningOutput{}
 		if request.Reasoning.Effort != "" {
 			reasoning.Effort = &request.Reasoning.Effort
 		}
-		if request.Reasoning.Summary != "" {
-			reasoning.Summary = &request.Reasoning.Summary
+		if effectiveSummary != "" {
+			reasoning.Summary = &effectiveSummary
 		}
 	}
 
