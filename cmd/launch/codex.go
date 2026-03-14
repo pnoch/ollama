@@ -39,7 +39,7 @@ type CodexSession struct {
 }
 
 func (c *Codex) args(model string, extra []string) []string {
-	args := []string{"--oss"}
+	args := []string{"--oss", "--local-provider=ollama"}
 	if model != "" {
 		args = append(args, "-m", model)
 	}
@@ -57,18 +57,8 @@ func (c *Codex) RunContext(ctx context.Context, model string, args []string) err
 	}
 
 	cmdArgs := c.args(model, args)
-	catalogArg, cleanup, err := codexModelCatalogArg(model)
-	if err != nil {
-		return fmt.Errorf("failed to prepare codex model catalog: %w", err)
-	}
-	if catalogArg != "" {
-		cmdArgs = append(cmdArgs[:len(cmdArgs)-len(args)], append([]string{"-c", catalogArg}, cmdArgs[len(cmdArgs)-len(args):]...)...)
-	}
-	if cleanup != nil {
-		defer cleanup()
-	}
 
-	cmd := exec.CommandContext(ctx, "codex", cmdArgs...)
+	cmd := exec.Command("codex", cmdArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -76,7 +66,6 @@ func (c *Codex) RunContext(ctx context.Context, model string, args []string) err
 		"OPENAI_BASE_URL="+envconfig.Host().String()+"/v1/",
 		"OPENAI_API_KEY=ollama",
 	)
-	setCodexSysProcAttr(cmd)
 	return cmd.Run()
 }
 
