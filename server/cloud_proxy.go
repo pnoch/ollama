@@ -361,17 +361,23 @@ func normalizeCloudResponsesInput(raw json.RawMessage, model string) (json.RawMe
 }
 
 func cloudResponsesInputCompactThreshold(model string) int {
-	limit := cloudResponsesInputCompactMax
+	// Default: compact when the conversation exceeds ~25% of the model's
+	// context window. For unknown models fall back to cloudResponsesInputCompactMax.
+	const defaultFraction = 4 // context / 4 = 25%
+	const minThreshold = 2000  // never compact below 2k tokens
+	const maxThreshold = 60000 // cap at 60k to avoid extremely late compaction
+
 	if modelLimit, ok := lookupCloudModelLimit(model); ok && modelLimit.Context > 0 {
-		candidate := modelLimit.Context / 32
-		if candidate > limit {
-			limit = candidate
+		threshold := modelLimit.Context / defaultFraction
+		if threshold < minThreshold {
+			threshold = minThreshold
 		}
+		if threshold > maxThreshold {
+			threshold = maxThreshold
+		}
+		return threshold
 	}
-	if limit > 12000 {
-		return 12000
-	}
-	return limit
+	return cloudResponsesInputCompactMax
 }
 
 func estimateResponsesInputTokens(items []map[string]any) int {
@@ -1052,7 +1058,19 @@ func sanitizeResponsesPayload(body []byte, modelAlias, modelBase string) ([]byte
 	return json.Marshal(sanitized)
 }
 
+// sanitizeResponsesMaxDepth is the maximum recursion depth for
+// sanitizeResponsesValue. Beyond this depth the value is returned as-is
+// to prevent a stack overflow on pathologically nested tool responses.
+const sanitizeResponsesMaxDepth = 64
+
 func sanitizeResponsesValue(v any, modelAlias, modelBase string) (any, bool) {
+	return sanitizeResponsesValueDepth(v, modelAlias, modelBase, 0)
+}
+
+func sanitizeResponsesValueDepth(v any, modelAlias, modelBase string, depth int) (any, bool) {
+	if depth > sanitizeResponsesMaxDepth {
+		return v, false
+	}
 	switch x := v.(type) {
 	case map[string]any:
 		if itemType, _ := x["type"].(string); itemType == "reasoning" {
@@ -1072,7 +1090,7 @@ func sanitizeResponsesValue(v any, modelAlias, modelBase string) (any, bool) {
 			x["model"] = modelAlias
 		}
 		for key, value := range x {
-			sanitized, drop := sanitizeResponsesValue(value, modelAlias, modelBase)
+			sanitized, drop := sanitizeResponsesValueDepth(value, modelAlias, modelBase, depth+1)
 			if drop {
 				delete(x, key)
 				continue
@@ -1099,7 +1117,7 @@ func sanitizeResponsesValue(v any, modelAlias, modelBase string) (any, bool) {
 	case []any:
 		filtered := make([]any, 0, len(x))
 		for _, value := range x {
-			sanitized, drop := sanitizeResponsesValue(value, modelAlias, modelBase)
+			sanitized, drop := sanitizeResponsesValueDepth(value, modelAlias, modelBase, depth+1)
 			if drop {
 				continue
 			}

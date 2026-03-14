@@ -288,7 +288,7 @@ func (m *model) openCodexSessionModal(selectedModel string) {
 		return
 	}
 	if len(sessions) == 0 {
-		m.statusMsg = "No Codex sessions found."
+		m.statusMsg = fmt.Sprintf("No Codex sessions found in %s", cwd)
 		return
 	}
 

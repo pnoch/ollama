@@ -239,7 +239,13 @@ func readCodexSessionMeta(path string) (CodexSession, bool) {
 }
 
 func dedupeCodexSessions(sessions []CodexSession) []CodexSession {
-	seen := make(map[string]struct{}, len(sessions))
+	if len(sessions) == 0 {
+		return sessions
+	}
+	// Use a smaller initial capacity: duplicates are rare so we avoid
+	// allocating a full-size map and slice in the common no-duplicate case.
+	initCap := len(sessions)/2 + 1
+	seen := make(map[string]struct{}, initCap)
 	deduped := make([]CodexSession, 0, len(sessions))
 	for _, session := range sessions {
 		if _, ok := seen[session.ID]; ok {
@@ -320,6 +326,13 @@ func detectCodexSessionModel(data []byte) string {
 
 func detectCodexSessionPrompt(data []byte) string {
 	lines := bytes.Split(data, []byte("\n"))
+	// Only scan the first 50 lines: the initial user prompt always appears
+	// near the top of the JSONL file, so scanning the whole file is wasteful
+	// for long sessions.
+	const maxPromptScanLines = 50
+	if len(lines) > maxPromptScanLines {
+		lines = lines[:maxPromptScanLines]
+	}
 	for _, line := range lines {
 		if len(line) == 0 || !bytes.Contains(line, []byte(`"user_message"`)) {
 			continue
@@ -437,11 +450,20 @@ func cloneCodexCatalogEntry(entry map[string]any) (map[string]any, error) {
 	return cloned, nil
 }
 
-func codexModelDescription(model string) string {
+// codexModelDescriptionMap is built once from recommendedModels for O(1) lookup.
+var codexModelDescriptionMap = func() map[string]string {
+	m := make(map[string]string, len(recommendedModels))
 	for _, item := range recommendedModels {
-		if item.Name == model {
-			return item.Description
+		if item.Description != "" {
+			m[item.Name] = item.Description
 		}
+	}
+	return m
+}()
+
+func codexModelDescription(model string) string {
+	if desc, ok := codexModelDescriptionMap[model]; ok {
+		return desc
 	}
 	return model
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/ollama/ollama/internal/strutil"
 )
 
 const (
@@ -1330,75 +1331,10 @@ func makeResponsesAssistantMessage(text string) map[string]any {
 	}
 }
 
-func stripOuterBrackets(s string) string {
-	pairs := map[byte]byte{'(': ')', '[': ']', '{': '}'}
-	for len(s) >= 2 {
-		open := s[0]
-		close, ok := pairs[open]
-		if !ok || s[len(s)-1] != close {
-			return s
-		}
-		depth := 0
-		matched := false
-		for i := 0; i < len(s); i++ {
-			if s[i] == open {
-				depth++
-			}
-			if s[i] == close {
-				depth--
-				if depth == 0 {
-					matched = (i == len(s)-1)
-					break
-				}
-			}
-		}
-		if !matched {
-			return s
-		}
-		s = strings.TrimSpace(s[1 : len(s)-1])
-	}
-	return s
-}
+// stripOuterBrackets delegates to internal/strutil.StripOuterBrackets.
+// The implementation lives there so it can be tested independently of the
+// server package's CGO (MLX) build constraints.
+func stripOuterBrackets(s string) string { return strutil.StripOuterBrackets(s) }
 
-func stripOuterQuotes(s string) string {
-	for len(s) >= 2 {
-		var q byte
-		switch s[0] {
-		case '"':
-			q = '"'
-		case '\'':
-			q = '\''
-		default:
-			return s
-		}
-		if s[len(s)-1] != q {
-			return s
-		}
-		inner := s[1 : len(s)-1]
-		// Only strip if the same quote character does not appear unescaped
-		// inside, which would mean the outer quotes are not a matched pair
-		// around the whole string (e.g. `"hello" world "test"` must not be
-		// stripped, nor should `"he said \"hello\""` be stripped).
-		if containsUnescapedByte(inner, q) {
-			return s
-		}
-		s = strings.TrimSpace(inner)
-	}
-	return s
-}
-
-// containsUnescapedByte reports whether b appears in s without a preceding
-// backslash. It is used to guard against stripping quotes around strings that
-// contain escaped quote characters (e.g. `"he said \"hello\""`).
-func containsUnescapedByte(s string, b byte) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' {
-			i++ // skip the escaped character
-			continue
-		}
-		if s[i] == b {
-			return true
-		}
-	}
-	return false
-}
+// stripOuterQuotes delegates to internal/strutil.StripOuterQuotes.
+func stripOuterQuotes(s string) string { return strutil.StripOuterQuotes(s) }
