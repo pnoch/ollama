@@ -1933,3 +1933,190 @@ func TestResponsesStreamConverter_FunctionCallStatus(t *testing.T) {
 		t.Errorf("output_item.done status = %q, want %q", doneItem["status"], "completed")
 	}
 }
+
+// TestFromResponsesRequest_WebSearchPreview verifies that a web_search_preview
+// built-in tool is translated into a web_search function tool for local models.
+func TestFromResponsesRequest_WebSearchPreview(t *testing.T) {
+	req := ResponsesRequest{
+		Model: "llama3.2",
+		Input: ResponsesInput{Text: "What happened today?"},
+		Tools: []ResponsesTool{
+			{Type: "web_search_preview"},
+		},
+	}
+	chatReq, err := FromResponsesRequest(req)
+	if err != nil {
+		t.Fatalf("FromResponsesRequest error: %v", err)
+	}
+	if len(chatReq.Tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(chatReq.Tools))
+	}
+	tool := chatReq.Tools[0]
+	if tool.Function.Name != "web_search" {
+		t.Errorf("tool name = %q, want %q", tool.Function.Name, "web_search")
+	}
+	if tool.Type != "function" {
+		t.Errorf("tool type = %q, want %q", tool.Type, "function")
+	}
+	// Parameters must include a "query" property.
+	if _, ok := tool.Function.Parameters.Properties.Get("query"); !ok {
+		t.Error("expected 'query' parameter in web_search tool")
+	}
+}
+
+// TestFromResponsesRequest_WebSearchPreviewWithFunctionTools verifies that
+// web_search_preview and regular function tools can coexist.
+func TestFromResponsesRequest_WebSearchPreviewWithFunctionTools(t *testing.T) {
+	desc := "A custom tool"
+	req := ResponsesRequest{
+		Model: "llama3.2",
+		Input: ResponsesInput{Text: "hello"},
+		Tools: []ResponsesTool{
+			{Type: "web_search_preview"},
+			{
+				Type:        "function",
+				Name:        "my_tool",
+				Description: &desc,
+				Parameters: map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+					"required":   []any{},
+				},
+			},
+		},
+	}
+	chatReq, err := FromResponsesRequest(req)
+	if err != nil {
+		t.Fatalf("FromResponsesRequest error: %v", err)
+	}
+	if len(chatReq.Tools) != 2 {
+		t.Fatalf("expected 2 tools, got %d", len(chatReq.Tools))
+	}
+	names := map[string]bool{}
+	for _, tool := range chatReq.Tools {
+		names[tool.Function.Name] = true
+	}
+	if !names["web_search"] {
+		t.Error("expected web_search tool")
+	}
+	if !names["my_tool"] {
+		t.Error("expected my_tool")
+	}
+}
+
+// TestHasWebSearchPreview verifies the HasWebSearchPreview helper.
+func TestHasWebSearchPreview(t *testing.T) {
+	tests := []struct {
+		name     string
+		tools    []ResponsesTool
+		wantType string
+		wantOK   bool
+	}{
+		{
+			name:   "empty",
+			tools:  nil,
+			wantOK: false,
+		},
+		{
+			name:     "web_search_preview",
+			tools:    []ResponsesTool{{Type: "web_search_preview"}},
+			wantType: "web_search_preview",
+			wantOK:   true,
+		},
+		{
+			name:     "web_search_preview_2024_11_01",
+			tools:    []ResponsesTool{{Type: "web_search_preview_2024_11_01"}},
+			wantType: "web_search_preview_2024_11_01",
+			wantOK:   true,
+		},
+		{
+			name:   "function only",
+			tools:  []ResponsesTool{{Type: "function", Name: "my_tool"}},
+			wantOK: false,
+		},
+		{
+			name: "mixed",
+			tools: []ResponsesTool{
+				{Type: "function", Name: "my_tool"},
+				{Type: "web_search_preview"},
+			},
+			wantType: "web_search_preview",
+			wantOK:   true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := HasWebSearchPreview(tt.tools)
+			if ok != tt.wantOK {
+				t.Errorf("HasWebSearchPreview ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && got.Type != tt.wantType {
+				t.Errorf("HasWebSearchPreview type = %q, want %q", got.Type, tt.wantType)
+			}
+		})
+	}
+}
+
+// TestResponsesStreamConverter_WebSearchCallEvents verifies that
+// WebSearchCallEvents emits the correct output_item.added and output_item.done
+// events and increments the output index.
+func TestResponsesStreamConverter_WebSearchCallEvents(t *testing.T) {
+	c := NewResponsesStreamConverter("resp_test", "msg_test", "llama3.2", ResponsesRequest{})
+	results := []map[string]any{
+		{"title": "Result 1", "url": "https://example.com", "content": "Some content"},
+	}
+	events := c.WebSearchCallEvents("ws_1_5", "test query", results)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	// First event: output_item.added with status in_progress
+	addedEvent := events[0]
+	if addedEvent.Event != "response.output_item.added" {
+		t.Errorf("event[0].Event = %q, want %q", addedEvent.Event, "response.output_item.added")
+	}
+	addedData, _ := addedEvent.Data.(map[string]any)
+	if addedData == nil {
+		t.Fatal("event[0] Data is not map[string]any")
+	}
+	addedItem, _ := addedData["item"].(map[string]any)
+	if addedItem == nil {
+		t.Fatal("event[0] missing item")
+	}
+	if addedItem["type"] != "web_search_call" {
+		t.Errorf("item type = %q, want %q", addedItem["type"], "web_search_call")
+	}
+	if addedItem["status"] != "in_progress" {
+		t.Errorf("item status = %q, want %q", addedItem["status"], "in_progress")
+	}
+	action, _ := addedItem["action"].(map[string]any)
+	if action == nil || action["query"] != "test query" {
+		t.Errorf("item action query = %v, want %q", action, "test query")
+	}
+	// Second event: output_item.done with status completed
+	doneEvent := events[1]
+	if doneEvent.Event != "response.output_item.done" {
+		t.Errorf("event[1].Event = %q, want %q", doneEvent.Event, "response.output_item.done")
+	}
+	doneData, _ := doneEvent.Data.(map[string]any)
+	if doneData == nil {
+		t.Fatal("event[1] Data is not map[string]any")
+	}
+	doneItem, _ := doneData["item"].(map[string]any)
+	if doneItem == nil {
+		t.Fatal("event[1] missing item")
+	}
+	if doneItem["status"] != "completed" {
+		t.Errorf("done item status = %q, want %q", doneItem["status"], "completed")
+	}
+	if _, ok := doneItem["results"]; !ok {
+		t.Error("done item missing results")
+	}
+	// Output index should have been incremented.
+	if c.outputIndex != 1 {
+		t.Errorf("outputIndex = %d, want 1", c.outputIndex)
+	}
+	// Item should be stored in toolCallItems.
+	if len(c.toolCallItems) != 1 {
+		t.Errorf("toolCallItems len = %d, want 1", len(c.toolCallItems))
+	}
+}

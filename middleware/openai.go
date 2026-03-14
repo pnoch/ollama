@@ -499,6 +499,27 @@ func (w *ResponsesWriter) writeResponse(data []byte) (int, error) {
 	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
 }
 
+// writeResponseWithWebSearch builds a non-streaming Responses API response that
+// includes a web_search_call output item before the final assistant message.
+func (w *ResponsesWriter) writeResponseWithWebSearch(data []byte, wsItemID, query string, results []map[string]any) (int, error) {
+	var chatResponse api.ChatResponse
+	if err := json.Unmarshal(data, &chatResponse); err != nil {
+		return 0, err
+	}
+	w.ResponseWriter.Header().Set("Content-Type", "application/json")
+	response := openai.ToResponse(w.model, w.responseID, w.itemID, chatResponse, w.request)
+	completedAt := time.Now().Unix()
+	response.CompletedAt = &completedAt
+	// Prepend the web_search_call output item.
+	wsItem := openai.ResponsesOutputItem{
+		ID:     wsItemID,
+		Type:   "web_search_call",
+		Status: "completed",
+	}
+	response.Output = append([]openai.ResponsesOutputItem{wsItem}, response.Output...)
+	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
+}
+
 func (w *ResponsesWriter) Write(data []byte) (int, error) {
 	code := w.ResponseWriter.Status()
 	if code != http.StatusOK {
@@ -589,7 +610,20 @@ func ResponsesMiddleware() gin.HandlerFunc {
 			c.Writer.Header().Set("Connection", "keep-alive")
 		}
 
-		c.Writer = w
+		// If the request includes a web_search_preview built-in tool, wrap the
+		// writer with the agent loop that executes searches server-side and
+		// emits web_search_call events. This makes web_search_preview work
+		// identically for local models as it does for cloud models.
+		if _, hasWS := openai.HasWebSearchPreview(req.Tools); hasWS {
+			c.Writer = &ResponsesWebSearchWriter{
+				BaseWriter: BaseWriter{ResponseWriter: c.Writer},
+				inner:      w,
+				req:        req,
+				chatReq:    chatReq,
+			}
+		} else {
+			c.Writer = w
+		}
 		c.Next()
 	}
 }
@@ -701,4 +735,274 @@ func ImageEditsMiddleware() gin.HandlerFunc {
 		c.Writer = w
 		c.Next()
 	}
+}
+
+// ResponsesWebSearchWriter intercepts Responses API responses that contain a
+// web_search tool call, executes the search server-side (via ollama.com/api/web_search),
+// feeds the results back to the model as a tool message, and emits the correct
+// Responses API streaming events (web_search_call, then the final text response).
+//
+// This makes web_search_preview work identically for both cloud and local models:
+// the cloud proxy forwards the request verbatim; local models go through this writer.
+type ResponsesWebSearchWriter struct {
+	BaseWriter
+	inner   *ResponsesWriter
+	req     openai.ResponsesRequest
+	chatReq *api.ChatRequest
+}
+
+const maxResponsesWebSearchLoops = 3
+
+func (w *ResponsesWebSearchWriter) Write(data []byte) (int, error) {
+	code := w.ResponseWriter.Status()
+	if code != http.StatusOK {
+		return w.inner.writeError(data)
+	}
+	var chatResponse api.ChatResponse
+	if err := json.Unmarshal(data, &chatResponse); err != nil {
+		return 0, err
+	}
+
+	wsCall, hasWebSearch, _ := findResponsesWebSearchCall(chatResponse.Message.ToolCalls)
+	if !hasWebSearch {
+		// No web_search call — pass through to the normal ResponsesWriter.
+		return w.inner.writeResponse(data)
+	}
+
+	// Run the agent loop synchronously (non-streaming and streaming both handled here).
+	ctx := w.inner.request.Stream != nil // just used as a bool below
+	_ = ctx
+	return w.runLoop(chatResponse, wsCall)
+}
+
+func (w *ResponsesWebSearchWriter) runLoop(initialResp api.ChatResponse, initialCall api.ToolCall) (int, error) {
+	followUpMessages := make([]api.Message, 0, len(w.chatReq.Messages)+maxResponsesWebSearchLoops*2)
+	followUpMessages = append(followUpMessages, w.chatReq.Messages...)
+	followUpTools := append(api.Tools(nil), w.chatReq.Tools...)
+
+	currentResp := initialResp
+	currentCall := initialCall
+
+	stream := w.req.Stream != nil && *w.req.Stream
+
+	// For streaming: emit response.created + response.in_progress first.
+	// The converter handles this on the first Process() call, but since we are
+	// taking over the write path we need to prime it.
+	if stream {
+		w.inner.converter.ResetFirstWrite()
+	}
+
+	for loop := 1; loop <= maxResponsesWebSearchLoops; loop++ {
+		query := responsesExtractQuery(&currentCall)
+		if query == "" {
+			break
+		}
+
+		// Execute the web search.
+		results, err := responsesWebSearch(query)
+		if err != nil {
+			// On search failure, fall back to passing the original response through.
+			break
+		}
+
+		wsItemID := fmt.Sprintf("ws_%d_%d", loop, len(query))
+
+		// Emit web_search_call events (streaming only; non-streaming builds them at end).
+		if stream {
+			events := w.inner.converter.WebSearchCallEvents(wsItemID, query, results)
+			for _, ev := range events {
+				if err := w.inner.writeEvent(ev.Event, ev.Data); err != nil {
+					return 0, err
+				}
+			}
+		}
+
+		// Build follow-up messages: assistant tool call + tool result.
+		assistantMsg := api.Message{
+			Role:      "assistant",
+			ToolCalls: []api.ToolCall{currentCall},
+		}
+		if currentResp.Message.Content != "" {
+			assistantMsg.Content = currentResp.Message.Content
+		}
+		toolResultMsg := api.Message{
+			Role:       "tool",
+			Content:    responsesFormatSearchResults(results),
+			ToolCallID: currentCall.ID,
+		}
+		followUpMessages = append(followUpMessages, assistantMsg, toolResultMsg)
+
+		// Call /api/chat for the follow-up.
+		followUpResp, err := responsesCallFollowUp(w.chatReq.Model, followUpMessages, followUpTools, w.chatReq.Options)
+		if err != nil {
+			break
+		}
+
+		// Check if the follow-up also wants to search.
+		nextCall, hasMore, _ := findResponsesWebSearchCall(followUpResp.Message.ToolCalls)
+		if !hasMore {
+			// Final response — emit it.
+			if stream {
+				// Emit the final text response events.
+				finalData, err := json.Marshal(followUpResp)
+				if err != nil {
+					return 0, err
+				}
+				return w.inner.writeResponse(finalData)
+			}
+			// Non-streaming: build response with web_search_call items prepended.
+			finalData, err := json.Marshal(followUpResp)
+			if err != nil {
+				return 0, err
+			}
+			return w.inner.writeResponseWithWebSearch(finalData, wsItemID, query, results)
+		}
+		currentResp = followUpResp
+		currentCall = nextCall
+	}
+
+	// Fallback: emit the last response as-is.
+	fallbackData, err := json.Marshal(currentResp)
+	if err != nil {
+		return 0, err
+	}
+	return w.inner.writeResponse(fallbackData)
+}
+
+// findResponsesWebSearchCall finds the first web_search tool call in a list.
+func findResponsesWebSearchCall(toolCalls []api.ToolCall) (api.ToolCall, bool, bool) {
+	var wsCall api.ToolCall
+	hasWebSearch := false
+	hasOther := false
+	for _, tc := range toolCalls {
+		if tc.Function.Name == "web_search" {
+			if !hasWebSearch {
+				wsCall = tc
+				hasWebSearch = true
+			}
+			continue
+		}
+		hasOther = true
+	}
+	return wsCall, hasWebSearch, hasOther
+}
+
+// responsesExtractQuery extracts the "query" argument from a web_search tool call.
+func responsesExtractQuery(tc *api.ToolCall) string {
+	q, ok := tc.Function.Arguments.Get("query")
+	if !ok {
+		return ""
+	}
+	if s, ok := q.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// responsesWebSearch calls ollama.com/api/web_search and returns results as
+// []map[string]any for embedding in Responses API events.
+func responsesWebSearch(query string) ([]map[string]any, error) {
+	type searchReq struct {
+		Query      string `json:"query"`
+		MaxResults int    `json:"max_results,omitempty"`
+	}
+	type searchResult struct {
+		Title   string `json:"title"`
+		URL     string `json:"url"`
+		Content string `json:"content"`
+	}
+	type searchResp struct {
+		Results []searchResult `json:"results"`
+	}
+
+	body, err := json.Marshal(searchReq{Query: query, MaxResults: 5})
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "https://ollama.com/api/web_search", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("web search returned status %d", resp.StatusCode)
+	}
+
+	var sr searchResp
+	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+		return nil, err
+	}
+
+	results := make([]map[string]any, 0, len(sr.Results))
+	for _, r := range sr.Results {
+		results = append(results, map[string]any{
+			"title":   r.Title,
+			"url":     r.URL,
+			"content": r.Content,
+		})
+	}
+	return results, nil
+}
+
+// responsesFormatSearchResults formats search results as a plain-text tool message.
+func responsesFormatSearchResults(results []map[string]any) string {
+	var sb strings.Builder
+	for i, r := range results {
+		title, _ := r["title"].(string)
+		url, _ := r["url"].(string)
+		content, _ := r["content"].(string)
+		fmt.Fprintf(&sb, "%d. %s\n   URL: %s\n", i+1, title, url)
+		if content != "" {
+			runes := []rune(content)
+			if len(runes) > 300 {
+				content = string(runes[:300]) + "..."
+			}
+			fmt.Fprintf(&sb, "   %s\n", content)
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// responsesCallFollowUp makes a non-streaming /api/chat call for the web search follow-up.
+func responsesCallFollowUp(model string, messages []api.Message, tools api.Tools, options map[string]any) (api.ChatResponse, error) {
+	streaming := false
+	req := api.ChatRequest{
+		Model:    model,
+		Messages: messages,
+		Stream:   &streaming,
+		Tools:    tools,
+		Options:  options,
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return api.ChatResponse{}, err
+	}
+	chatURL := "http://localhost:11434/api/chat"
+	httpReq, err := http.NewRequest(http.MethodPost, chatURL, bytes.NewReader(body))
+	if err != nil {
+		return api.ChatResponse{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return api.ChatResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.ChatResponse{}, fmt.Errorf("follow-up /api/chat returned status %d", resp.StatusCode)
+	}
+	var chatResp api.ChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return api.ChatResponse{}, err
+	}
+	return chatResp, nil
 }

@@ -333,12 +333,34 @@ type ResponsesText struct {
 
 // ResponsesTool represents a tool in the Responses API format.
 // Note: This differs from api.Tool which nests fields under "function".
+//
+// The Type field discriminates between user-defined function tools and
+// built-in hosted tools:
+//   - "function"            — user-defined function (Name/Description/Parameters present)
+//   - "web_search_preview"  — hosted web search (SearchContextSize/AllowedDomains may be set)
+//   - "file_search"         — hosted vector-store search (not yet implemented locally)
+//   - "computer_use_preview"— hosted computer control (not yet implemented locally)
 type ResponsesTool struct {
-	Type        string         `json:"type"` // "function"
+	Type        string         `json:"type"` // "function", "web_search_preview", ...
 	Name        string         `json:"name"`
 	Description *string        `json:"description"` // nullable but required
 	Strict      *bool          `json:"strict"`      // nullable but required
 	Parameters  map[string]any `json:"parameters"`  // nullable but required
+
+	// web_search_preview fields
+	SearchContextSize string   `json:"search_context_size,omitempty"` // "low", "medium", "high"
+	AllowedDomains    []string `json:"allowed_domains,omitempty"`
+}
+
+// HasWebSearchPreview reports whether the tool list contains a web_search_preview
+// built-in tool, and returns the first one found.
+func HasWebSearchPreview(tools []ResponsesTool) (ResponsesTool, bool) {
+	for _, t := range tools {
+		if strings.HasPrefix(t.Type, "web_search") {
+			return t, true
+		}
+	}
+	return ResponsesTool{}, false
 }
 
 type ResponsesRequest struct {
@@ -543,13 +565,27 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 	// tool_choice is passed through to api.ChatRequest.ToolChoice so that the
 	// core server can apply grammar-constrained generation (GBNF via
 	// llama.SchemaToGrammar) and system-message enforcement at the sampler level.
+	//
+	// Built-in hosted tools (web_search_preview, file_search, computer_use_preview)
+	// are translated to equivalent function tool definitions so that local models
+	// can emit structured tool calls. The middleware layer (ResponsesWebSearchWriter)
+	// intercepts those calls, executes them server-side, and feeds results back.
 	var tools []api.Tool
 	for _, t := range r.Tools {
-		tool, err := convertTool(t)
-		if err != nil {
-			return nil, err
+		switch {
+		case strings.HasPrefix(t.Type, "web_search"):
+			// Translate web_search_preview → web_search function tool.
+			// The ResponsesWebSearchWriter in middleware/openai.go intercepts
+			// web_search tool calls and executes them server-side.
+			tools = append(tools, webSearchFunctionTool())
+		default:
+			// function tools and unrecognised built-ins pass through as-is.
+			tool, err := convertTool(t)
+			if err != nil {
+				return nil, err
+			}
+			tools = append(tools, tool)
 		}
-		tools = append(tools, tool)
 	}
 
 	// Handle text format (e.g. json_schema)
@@ -611,6 +647,29 @@ func convertTool(t ResponsesTool) (api.Tool, error) {
 			Parameters:  params,
 		},
 	}, nil
+}
+
+// webSearchFunctionTool returns the api.Tool definition for the built-in web_search
+// function. This is injected into the tool list when the client requests
+// web_search_preview so that local models can emit structured web_search calls.
+func webSearchFunctionTool() api.Tool {
+	props := api.NewToolPropertiesMap()
+	props.Set("query", api.ToolProperty{
+		Type:        api.PropertyType{"string"},
+		Description: "The search query to look up on the web",
+	})
+	return api.Tool{
+		Type: "function",
+		Function: api.ToolFunction{
+			Name:        "web_search",
+			Description: "Search the web for current information. Use this when you need up-to-date information that may not be in your training data.",
+			Parameters: api.ToolFunctionParameters{
+				Type:       "object",
+				Properties: props,
+				Required:   []string{"query"},
+			},
+		},
+	}
 }
 
 func convertInputMessage(m ResponsesInputMessage) (api.Message, error) {
@@ -863,19 +922,19 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 			}
 			return "auto"
 		}(), // Echo back the request's tool_choice, defaulting to "auto"
-		Truncation:         truncation,
-		ParallelToolCalls:  true, // Default value
-		Text:               text,
-		TopP:               derefFloat64(request.TopP, 1.0),
-		PresencePenalty:    0, // Default value
-		FrequencyPenalty:   0, // Default value
-		TopLogprobs:        0, // Default value
-		Temperature:        derefFloat64(request.Temperature, 1.0),
-		Reasoning:          reasoning,
+		Truncation:        truncation,
+		ParallelToolCalls: true, // Default value
+		Text:              text,
+		TopP:              derefFloat64(request.TopP, 1.0),
+		PresencePenalty:   0, // Default value
+		FrequencyPenalty:  0, // Default value
+		TopLogprobs:       0, // Default value
+		Temperature:       derefFloat64(request.Temperature, 1.0),
+		Reasoning:         reasoning,
 		Usage: &ResponsesUsage{
-			InputTokens:  chatResponse.PromptEvalCount,
-			OutputTokens: chatResponse.EvalCount,
-			TotalTokens:  chatResponse.PromptEvalCount + chatResponse.EvalCount,
+			InputTokens:        chatResponse.PromptEvalCount,
+			OutputTokens:       chatResponse.EvalCount,
+			TotalTokens:        chatResponse.PromptEvalCount + chatResponse.EvalCount,
 			InputTokensDetails: ResponsesInputTokensDetails{CachedTokens: 0},
 			// Ollama does not report thinking tokens separately; estimate from
 			// the thinking text length using the standard ~4 chars/token heuristic.
@@ -951,6 +1010,14 @@ func NewResponsesStreamConverter(responseID, itemID, model string, request Respo
 		request:    request,
 		firstWrite: true,
 	}
+}
+
+// ResetFirstWrite re-enables the initial response.created / response.in_progress
+// events so they are emitted again after the web search agent loop takes over
+// the write path. This is needed because the converter may have already been
+// primed by an earlier (discarded) write.
+func (c *ResponsesStreamConverter) ResetFirstWrite() {
+	c.firstWrite = true
 }
 
 // Process takes a ChatResponse and returns the events that should be emitted.
@@ -1085,24 +1152,24 @@ func (c *ResponsesStreamConverter) buildResponseObject(status string, output []a
 			}
 			return "auto"
 		}(),
-		"truncation":           truncation,
-		"parallel_tool_calls":  true,
-		"text":                 map[string]any{"format": textFormat},
-		"top_p":                topP,
-		"presence_penalty":     0,
-		"frequency_penalty":    0,
-		"top_logprobs":         0,
-		"temperature":          temperature,
-		"reasoning":            reasoning,
-		"usage":                usage,
-		"max_output_tokens":    c.request.MaxOutputTokens,
-		"max_tool_calls":       nil,
-		"store":                false,
-		"background":           c.request.Background,
-		"service_tier":         "default",
-		"metadata":             map[string]any{},
-		"safety_identifier":    nil,
-		"prompt_cache_key":     nil,
+		"truncation":          truncation,
+		"parallel_tool_calls": true,
+		"text":                map[string]any{"format": textFormat},
+		"top_p":               topP,
+		"presence_penalty":    0,
+		"frequency_penalty":   0,
+		"top_logprobs":        0,
+		"temperature":         temperature,
+		"reasoning":           reasoning,
+		"usage":               usage,
+		"max_output_tokens":   c.request.MaxOutputTokens,
+		"max_tool_calls":      nil,
+		"store":               false,
+		"background":          c.request.Background,
+		"service_tier":        "default",
+		"metadata":            map[string]any{},
+		"safety_identifier":   nil,
+		"prompt_cache_key":    nil,
 	}
 }
 
@@ -1247,6 +1314,52 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 		}))
 	}
 
+	return events
+}
+
+// WebSearchCallEvents emits the Responses API streaming events for a
+// web_search_call item: output_item.added (in_progress), output_item.done
+// (completed), and the final item stored for the response.completed payload.
+// The caller (ResponsesWebSearchWriter) must call this before the final
+// text-content events so that output indices are correct.
+func (c *ResponsesStreamConverter) WebSearchCallEvents(wsItemID, query string, results []map[string]any) []ResponsesStreamEvent {
+	var events []ResponsesStreamEvent
+
+	// response.output_item.added (status: in_progress)
+	events = append(events, c.newEvent("response.output_item.added", map[string]any{
+		"output_index": c.outputIndex,
+		"item": map[string]any{
+			"id":     wsItemID,
+			"type":   "web_search_call",
+			"status": "in_progress",
+			"action": map[string]any{
+				"type":  "search",
+				"query": query,
+			},
+		},
+	}))
+
+	// response.output_item.done (status: completed)
+	wsItem := map[string]any{
+		"id":     wsItemID,
+		"type":   "web_search_call",
+		"status": "completed",
+		"action": map[string]any{
+			"type":  "search",
+			"query": query,
+		},
+	}
+	if len(results) > 0 {
+		wsItem["results"] = results
+	}
+	events = append(events, c.newEvent("response.output_item.done", map[string]any{
+		"output_index": c.outputIndex,
+		"item":         wsItem,
+	}))
+
+	// Store for buildFinalOutput / response.completed
+	c.toolCallItems = append(c.toolCallItems, wsItem)
+	c.outputIndex++
 	return events
 }
 
