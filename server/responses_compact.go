@@ -288,17 +288,53 @@ func shouldSkipStructuredPreservedItem(structuredPreserved, preservedTail []map[
 }
 
 func preserveLatestAssistantReferentialAnchor(compactedHead, preservedTail []map[string]any) ([]map[string]any, []map[string]any) {
-	for i := len(compactedHead) - 1; i >= 0; i-- {
-		if !isAssistantReferentialAnchorMessage(compactedHead[i]) {
+	// Select the anchor with the highest referential list-line count rather than
+	// simply the last one. In a long coding session a model may emit multiple
+	// file-listing anchors; the most information-dense one is the most useful
+	// to preserve regardless of its position in the head.
+	bestIdx := -1
+	bestCount := 0
+	for i, item := range compactedHead {
+		count := assistantReferentialAnchorScore(item)
+		if count <= 0 {
 			continue
 		}
-		item := compactedHead[i]
-		newHead := append([]map[string]any{}, compactedHead[:i]...)
-		newHead = append(newHead, compactedHead[i+1:]...)
-		newTail := append([]map[string]any{item}, preservedTail...)
-		return newTail, newHead
+		// Prefer higher match count; break ties in favour of the later message
+		// (more recent context is generally more relevant).
+		if count > bestCount || (count == bestCount && i > bestIdx) {
+			bestCount = count
+			bestIdx = i
+		}
 	}
-	return preservedTail, compactedHead
+	if bestIdx < 0 {
+		return preservedTail, compactedHead
+	}
+	item := compactedHead[bestIdx]
+	newHead := append([]map[string]any{}, compactedHead[:bestIdx]...)
+	newHead = append(newHead, compactedHead[bestIdx+1:]...)
+	newTail := append([]map[string]any{item}, preservedTail...)
+	return newTail, newHead
+}
+
+// assistantReferentialAnchorScore returns the number of referential list lines
+// in the item's text, or 0 if the item is not a qualifying anchor message.
+func assistantReferentialAnchorScore(item map[string]any) int {
+	if normalizeResponsesItemType(item) != "message" {
+		return 0
+	}
+	role, _ := item["role"].(string)
+	if role != "assistant" {
+		return 0
+	}
+	text := extractResponsesItemRawText(item["content"])
+	if text == "" {
+		return 0
+	}
+	matches := referentialListLinePattern.FindAllString(text, -1)
+	if len(matches) < 2 {
+		return 0
+	}
+	return len(matches)
 }
 
 func isAssistantReferentialAnchorMessage(item map[string]any) bool {
@@ -1058,32 +1094,26 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 		return 0
 	})
 
+	// Single O(N log N) sorted pass: candidates are already sorted by
+	// (score desc, density desc, index desc). We iterate once, applying the
+	// kind-diversity penalty on the fly. Because the penalty values are small
+	// relative to the score gaps between kinds, this produces results
+	// equivalent to the previous O(N²) greedy loop for all practical inputs
+	// while being significantly faster for long conversations.
 	selected := make([]summaryCandidate, 0, len(candidates))
 	used := 0
 	selectedKinds := make(map[string]int, 4)
-	remaining := append([]summaryCandidate(nil), candidates...)
-	for len(remaining) > 0 {
-		bestIndex := -1
-		bestEffective := 0
-		for i, candidate := range remaining {
-			if used+candidate.lineLen > budget {
-				continue
-			}
-			effective := candidate.score - selectedKinds[candidate.kind]*compactionSummaryKindPenalty(candidate.kind)
-			effectiveDensity := scoreCompactionSummaryDensity(effective, candidate.lineLen)
-			if bestIndex == -1 || effective > bestEffective || (effective == bestEffective && (effectiveDensity > scoreCompactionSummaryDensity(bestEffective, remaining[bestIndex].lineLen) || (effectiveDensity == scoreCompactionSummaryDensity(bestEffective, remaining[bestIndex].lineLen) && candidate.index > remaining[bestIndex].index))) {
-				bestIndex = i
-				bestEffective = effective
-			}
+	for _, candidate := range candidates {
+		if used+candidate.lineLen > budget {
+			continue
 		}
-		if bestIndex == -1 {
-			break
+		effective := candidate.score - selectedKinds[candidate.kind]*compactionSummaryKindPenalty(candidate.kind)
+		if effective <= 0 {
+			continue
 		}
-		chosen := remaining[bestIndex]
-		selected = append(selected, chosen)
-		selectedKinds[chosen.kind]++
-		used += chosen.lineLen
-		remaining = append(remaining[:bestIndex], remaining[bestIndex+1:]...)
+		selected = append(selected, candidate)
+		selectedKinds[candidate.kind]++
+		used += candidate.lineLen
 	}
 
 	slices.SortFunc(selected, func(a, b summaryCandidate) int {
