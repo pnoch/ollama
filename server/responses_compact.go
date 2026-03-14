@@ -1300,14 +1300,26 @@ func stripOuterBrackets(s string) string {
 
 func stripOuterQuotes(s string) string {
 	for len(s) >= 2 {
-		switch {
-		case strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`):
-			s = strings.TrimSpace(s[1 : len(s)-1])
-		case strings.HasPrefix(s, `'`) && strings.HasSuffix(s, `'`):
-			s = strings.TrimSpace(s[1 : len(s)-1])
+		var q byte
+		switch s[0] {
+		case '"':
+			q = '"'
+		case '\'':
+			q = '\''
 		default:
 			return s
 		}
+		if s[len(s)-1] != q {
+			return s
+		}
+		// Only strip if the same quote character does not appear inside,
+		// which would mean the outer quotes are not a matched pair around
+		// the whole string (e.g. "hello" world "test" must not be stripped).
+		inner := s[1 : len(s)-1]
+		if strings.IndexByte(inner, q) >= 0 {
+			return s
+		}
+		s = strings.TrimSpace(inner)
 	}
 	return s
 }
