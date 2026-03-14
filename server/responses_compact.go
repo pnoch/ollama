@@ -1269,24 +1269,31 @@ func makeResponsesAssistantMessage(text string) map[string]any {
 }
 
 func stripOuterBrackets(s string) string {
+	pairs := map[byte]byte{'(': ')', '[': ']', '{': '}'}
 	for len(s) >= 2 {
-		var opener string
-		switch {
-		case strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")"):
-			opener = "("
-		case strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]"):
-			opener = "["
-		case strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}"):
-			opener = "{"
-		default:
+		open := s[0]
+		close, ok := pairs[open]
+		if !ok || s[len(s)-1] != close {
 			return s
 		}
-		inner := s[1 : len(s)-1]
-		if strings.HasPrefix(inner, opener) || strings.HasPrefix(inner, "[") || strings.HasPrefix(inner, "{") {
-			s = strings.TrimSpace(inner)
-		} else {
-			return strings.TrimSpace(inner)
+		depth := 0
+		matched := false
+		for i := 0; i < len(s); i++ {
+			if s[i] == open {
+				depth++
+			}
+			if s[i] == close {
+				depth--
+				if depth == 0 {
+					matched = (i == len(s)-1)
+					break
+				}
+			}
 		}
+		if !matched {
+			return s
+		}
+		s = strings.TrimSpace(s[1 : len(s)-1])
 	}
 	return s
 }
