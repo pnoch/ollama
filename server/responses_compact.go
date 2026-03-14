@@ -214,6 +214,7 @@ func splitCompactedTailWithBudget(items []map[string]any, chunkMax, charMax int)
 		candidate := chunks[startChunk-1]
 		candidateJSON, err := json.Marshal(candidate)
 		if err != nil {
+			slog.Warn("responses compaction: failed to marshal chunk during tail expansion", "error", err)
 			break
 		}
 		if len(chunks)-startChunk >= chunkMax {
@@ -225,7 +226,12 @@ func splitCompactedTailWithBudget(items []map[string]any, chunkMax, charMax int)
 		startChunk--
 		size += len(candidateJSON)
 	}
-
+	// If the loop exited without preserving anything (e.g. marshal error on the
+	// very first candidate), fall back to preserving at least the last chunk so
+	// we never compact the entire conversation with nothing preserved.
+	if startChunk == len(chunks) && len(chunks) > 0 {
+		startChunk = len(chunks) - 1
+	}
 	startItem := 0
 	for i := 0; i < startChunk; i++ {
 		startItem += len(chunks[i])
@@ -851,7 +857,9 @@ func summarizeCompactedMessageRun(items []map[string]any, index int) (summary st
 			break
 		}
 		if nextText == lastText {
-			currentRole = nextRole
+			// Skip duplicate text but do NOT advance currentRole; advancing it
+			// would allow the next message to bypass the same-role check and
+			// produce a confusing same-role pair in the summary output.
 			last = j
 			continue
 		}
@@ -882,7 +890,10 @@ func roleLabel(role string) string {
 func summaryDuplicatesPreserved(summary string, preservedTail []map[string]any) bool {
 	for _, item := range preservedTail {
 		text := extractResponsesItemText(item["content"])
-		if text != "" && strings.Contains(summary, text) {
+		// Require a minimum length to avoid false positives where a short
+		// common word (e.g. "ok", "yes") in a tail item incorrectly matches
+		// an unrelated summary part that merely contains that substring.
+		if len(text) >= 20 && strings.Contains(summary, text) {
 			return true
 		}
 	}

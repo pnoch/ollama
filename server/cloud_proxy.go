@@ -380,7 +380,13 @@ func estimateResponsesValueTokens(v any) int {
 		return total
 	case map[string]any:
 		total := 0
-		for _, child := range val {
+		for k, child := range val {
+			// Count key tokens in addition to value tokens; JSON keys contribute
+			// meaningfully to token usage and were previously ignored.
+			keyRunes := len([]rune(k))
+			if keyRunes > 0 {
+				total += keyRunes/4 + 1
+			}
 			total += estimateResponsesValueTokens(child)
 		}
 		return total
@@ -390,6 +396,10 @@ func estimateResponsesValueTokens(v any) int {
 }
 
 func normalizeCloudResponsesInputItem(item map[string]any) ([]map[string]any, error) {
+	return normalizeCloudResponsesInputItemDepth(item, 0)
+}
+
+func normalizeCloudResponsesInputItemDepth(item map[string]any, depth int) ([]map[string]any, error) {
 	itemType, _ := item["type"].(string)
 	switch itemType {
 	case "custom_tool_call":
@@ -402,6 +412,11 @@ func normalizeCloudResponsesInputItem(item map[string]any) ([]map[string]any, er
 		item["type"] = "function_call_output"
 		return []map[string]any{item}, nil
 	case "compaction":
+		// Guard against pathologically nested compaction items causing a stack overflow.
+		const maxCompactionDepth = 8
+		if depth >= maxCompactionDepth {
+			return nil, fmt.Errorf("compaction replacement_history nesting exceeds maximum depth of %d", maxCompactionDepth)
+		}
 		replacementHistory, _ := item["replacement_history"].([]any)
 		if len(replacementHistory) == 0 {
 			return nil, nil
@@ -412,7 +427,7 @@ func normalizeCloudResponsesInputItem(item map[string]any) ([]map[string]any, er
 			if replacement == nil {
 				continue
 			}
-			normalizedReplacement, err := normalizeCloudResponsesInputItem(replacement)
+			normalizedReplacement, err := normalizeCloudResponsesInputItemDepth(replacement, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -420,7 +435,16 @@ func normalizeCloudResponsesInputItem(item map[string]any) ([]map[string]any, er
 		}
 		return expanded, nil
 	case "web_search_call":
-		return nil, nil
+		// Convert web_search_call to a summary assistant message rather than
+		// silently dropping it. Items in preservedTail pass through this
+		// normalization, so dropping them would cause the model to lose
+		// awareness of web searches that occurred in the recent context.
+		if action, ok := item["action"].(map[string]any); ok {
+			if query := strings.TrimSpace(stringValue(action["query"])); query != "" {
+				return []map[string]any{makeResponsesAssistantMessage("Web search performed: " + query)}, nil
+			}
+		}
+		return []map[string]any{makeResponsesAssistantMessage("A web search was performed.")}, nil
 	default:
 		return []map[string]any{item}, nil
 	}
@@ -466,11 +490,14 @@ func readRequestBody(r *http.Request) ([]byte, error) {
 		reader = io.NopCloser(zstdReader)
 	}
 
-	body, err := io.ReadAll(reader)
+	const maxBodySize = 32 << 20 // 32 MB
+	body, err := io.ReadAll(io.LimitReader(reader, maxBodySize+1))
 	if err != nil {
 		return nil, err
 	}
-
+	if int64(len(body)) > maxBodySize {
+		return nil, fmt.Errorf("request body exceeds maximum allowed size of %d bytes", maxBodySize)
+	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	if strings.EqualFold(r.Header.Get("Content-Encoding"), "zstd") {
 		r.Header.Del("Content-Encoding")
@@ -759,9 +786,6 @@ func copySanitizedResponsesEventStream(dst http.ResponseWriter, src io.Reader, m
 					sawDoneSentinel = true
 				}
 				pendingEventLine = append(pendingEventLine[:0], line...)
-				if skipCurrentEvent {
-					goto nextLine
-				}
 				goto nextLine
 			}
 
