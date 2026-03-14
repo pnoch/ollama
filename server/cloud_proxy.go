@@ -324,19 +324,39 @@ func normalizeCloudResponsesInput(raw json.RawMessage, model string) (json.RawMe
 	}
 
 	estimatedTokens := estimateResponsesInputTokens(normalized)
-	if estimatedTokens <= cloudResponsesInputCompactThreshold(model) {
+	threshold := cloudResponsesInputCompactThreshold(model)
+	if estimatedTokens <= threshold {
 		return json.Marshal(normalized)
 	}
+
+	slog.Info("responses compaction triggered",
+		"model", model,
+		"estimated_tokens", estimatedTokens,
+		"threshold", threshold,
+		"items", len(normalized),
+	)
 
 	normalizedJSON, err := json.Marshal(normalized)
 	if err != nil {
 		return nil, err
 	}
-
 	compacted, err := compactResponsesInputForModel(normalizedJSON, model)
 	if err != nil {
-		return nil, err
+		// Compaction failed (e.g. summary LLM timeout). Fall back to the
+		// uncompacted input so the request is not failed outright. The model
+		// may still succeed if its context window is large enough, and the
+		// user is not left with a hard error.
+		slog.Warn("responses compaction failed, falling back to uncompacted input", "model", model, "error", err)
+		return normalizedJSON, nil
 	}
+	compactedTokens := estimateResponsesInputTokens(compacted)
+	slog.Info("responses compaction complete",
+		"model", model,
+		"items_before", len(normalized),
+		"items_after", len(compacted),
+		"tokens_before", estimatedTokens,
+		"tokens_after", compactedTokens,
+	)
 	return json.Marshal(compacted)
 }
 
@@ -362,6 +382,9 @@ func estimateResponsesInputTokens(items []map[string]any) int {
 	return total
 }
 
+// estimateResponsesValueTokens estimates the number of tokens in v.
+// String values use a conservative 3-chars-per-token ratio (instead of 4)
+// to account for code-heavy content where tokens are shorter on average.
 func estimateResponsesValueTokens(v any) int {
 	switch val := v.(type) {
 	case nil:
@@ -371,7 +394,9 @@ func estimateResponsesValueTokens(v any) int {
 		if runeCount == 0 {
 			return 0
 		}
-		return runeCount/4 + 1
+		// Use 3 chars/token (conservative) rather than 4 to reduce under-counting
+		// for code-heavy conversations where tokens are shorter than average prose.
+		return runeCount/3 + 1
 	case []any:
 		total := 0
 		for _, child := range val {

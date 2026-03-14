@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/ollama/ollama/envconfig"
@@ -77,9 +76,7 @@ func (c *Codex) RunContext(ctx context.Context, model string, args []string) err
 		"OPENAI_BASE_URL="+envconfig.Host().String()+"/v1/",
 		"OPENAI_API_KEY=ollama",
 	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
+	setCodexSysProcAttr(cmd)
 	return cmd.Run()
 }
 

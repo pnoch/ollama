@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -275,10 +276,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // openCodexSessionModal opens the session picker for the given Codex model.
 func (m *model) openCodexSessionModal(selectedModel string) {
-	sessions, err := launch.ListCodexSessions("", 30)
-	if err != nil || len(sessions) == 0 {
+	cwd, err := os.Getwd()
+	if err != nil {
+		m.statusMsg = "Unable to determine current directory for Codex sessions."
 		return
 	}
+
+	sessions, err := launch.ListCodexSessions(cwd, 30)
+	if err != nil {
+		m.statusMsg = "Unable to read Codex sessions."
+		return
+	}
+	if len(sessions) == 0 {
+		m.statusMsg = "No Codex sessions found."
+		return
+	}
+
+
 	items := make([]SelectItem, len(sessions))
 	var count int
 	for _, session := range sessions {

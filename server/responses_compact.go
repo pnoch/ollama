@@ -45,7 +45,7 @@ func (s *Server) ResponsesCompactHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"id":         fmt.Sprintf("respcomp_%s", uuid.New().String()[:8]),
+		"id":         fmt.Sprintf("respcomp_%s", uuid.New().String()),
 		"object":     "response.compaction",
 		"created_at": time.Now().Unix(),
 		"status":     "completed",
@@ -1032,6 +1032,10 @@ func buildCompactionSummary(parts []string, omittedCounts map[string]int) string
 	return strings.TrimSpace(summary[:responsesCompactSummaryMaxChars-3]) + "..."
 }
 
+// responsesCompactSummaryMaxItems caps the number of bullet points in a
+// compaction summary to keep it readable and avoid overwhelming the model.
+const responsesCompactSummaryMaxItems = 80
+
 func selectCompactionSummaryParts(parts []string, budget int) []string {
 	if budget <= 0 {
 		return nil
@@ -1104,6 +1108,9 @@ func selectCompactionSummaryParts(parts []string, budget int) []string {
 	used := 0
 	selectedKinds := make(map[string]int, 4)
 	for _, candidate := range candidates {
+		if len(selected) >= responsesCompactSummaryMaxItems {
+			break
+		}
 		if used+candidate.lineLen > budget {
 			continue
 		}
@@ -1367,14 +1374,31 @@ func stripOuterQuotes(s string) string {
 		if s[len(s)-1] != q {
 			return s
 		}
-		// Only strip if the same quote character does not appear inside,
-		// which would mean the outer quotes are not a matched pair around
-		// the whole string (e.g. "hello" world "test" must not be stripped).
 		inner := s[1 : len(s)-1]
-		if strings.IndexByte(inner, q) >= 0 {
+		// Only strip if the same quote character does not appear unescaped
+		// inside, which would mean the outer quotes are not a matched pair
+		// around the whole string (e.g. `"hello" world "test"` must not be
+		// stripped, nor should `"he said \"hello\""` be stripped).
+		if containsUnescapedByte(inner, q) {
 			return s
 		}
 		s = strings.TrimSpace(inner)
 	}
 	return s
+}
+
+// containsUnescapedByte reports whether b appears in s without a preceding
+// backslash. It is used to guard against stripping quotes around strings that
+// contain escaped quote characters (e.g. `"he said \"hello\""`).
+func containsUnescapedByte(s string, b byte) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++ // skip the escaped character
+			continue
+		}
+		if s[i] == b {
+			return true
+		}
+	}
+	return false
 }
