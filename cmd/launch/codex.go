@@ -58,6 +58,15 @@ func (c *Codex) RunContext(ctx context.Context, model string, args []string) err
 
 	cmdArgs := c.args(model, args)
 
+	// Add model catalog if available (don't fail if it doesn't work)
+	catalogArg, cleanup, err := codexModelCatalogArg(model)
+	if err == nil && catalogArg != "" {
+		cmdArgs = append(cmdArgs, "-c", catalogArg)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
 	cmd := exec.Command("codex", cmdArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
