@@ -3,7 +3,6 @@ package server
 import (
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"regexp"
 	"slices"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const (
@@ -45,7 +45,7 @@ func (s *Server) ResponsesCompactHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"id":         fmt.Sprintf("respcomp_%d", rand.Intn(999999)),
+		"id":         fmt.Sprintf("respcomp_%s", uuid.New().String()[:8]),
 		"object":     "response.compaction",
 		"created_at": time.Now().Unix(),
 		"status":     "completed",
@@ -1198,24 +1198,8 @@ trimmed:
 		"’", `'`,
 	).Replace(part)
 	part = strings.Join(strings.Fields(part), " ")
-	if len(part) >= 2 {
-		switch {
-		case strings.HasPrefix(part, "(") && strings.HasSuffix(part, ")"):
-			part = strings.TrimSpace(part[1 : len(part)-1])
-		case strings.HasPrefix(part, "[") && strings.HasSuffix(part, "]"):
-			part = strings.TrimSpace(part[1 : len(part)-1])
-		case strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}"):
-			part = strings.TrimSpace(part[1 : len(part)-1])
-		}
-	}
-	if len(part) >= 2 {
-		switch {
-		case strings.HasPrefix(part, `"`) && strings.HasSuffix(part, `"`):
-			part = strings.TrimSpace(part[1 : len(part)-1])
-		case strings.HasPrefix(part, `'`) && strings.HasSuffix(part, `'`):
-			part = strings.TrimSpace(part[1 : len(part)-1])
-		}
-	}
+	part = stripOuterBrackets(part)
+	part = stripOuterQuotes(part)
 	part = strings.TrimSpace(strings.TrimRight(part, " .,!?:;"))
 	return part
 }
@@ -1282,4 +1266,41 @@ func makeResponsesAssistantMessage(text string) map[string]any {
 			},
 		},
 	}
+}
+
+func stripOuterBrackets(s string) string {
+	for len(s) >= 2 {
+		var opener string
+		switch {
+		case strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")"):
+			opener = "("
+		case strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]"):
+			opener = "["
+		case strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}"):
+			opener = "{"
+		default:
+			return s
+		}
+		inner := s[1 : len(s)-1]
+		if strings.HasPrefix(inner, opener) || strings.HasPrefix(inner, "[") || strings.HasPrefix(inner, "{") {
+			s = strings.TrimSpace(inner)
+		} else {
+			return strings.TrimSpace(inner)
+		}
+	}
+	return s
+}
+
+func stripOuterQuotes(s string) string {
+	for len(s) >= 2 {
+		switch {
+		case strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`):
+			s = strings.TrimSpace(s[1 : len(s)-1])
+		case strings.HasPrefix(s, `'`) && strings.HasSuffix(s, `'`):
+			s = strings.TrimSpace(s[1 : len(s)-1])
+		default:
+			return s
+		}
+	}
+	return s
 }

@@ -2,16 +2,19 @@ package launch
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ollama/ollama/envconfig"
@@ -46,6 +49,10 @@ func (c *Codex) args(model string, extra []string) []string {
 }
 
 func (c *Codex) Run(model string, args []string) error {
+	return c.RunContext(context.Background(), model, args)
+}
+
+func (c *Codex) RunContext(ctx context.Context, model string, args []string) error {
 	if err := checkCodexVersion(); err != nil {
 		return err
 	}
@@ -62,7 +69,7 @@ func (c *Codex) Run(model string, args []string) error {
 		defer cleanup()
 	}
 
-	cmd := exec.Command("codex", cmdArgs...)
+	cmd := exec.CommandContext(ctx, "codex", cmdArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -70,6 +77,9 @@ func (c *Codex) Run(model string, args []string) error {
 		"OPENAI_BASE_URL="+envconfig.Host().String()+"/v1/",
 		"OPENAI_API_KEY=ollama",
 	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 	return cmd.Run()
 }
 
@@ -110,6 +120,7 @@ func ListCodexSessions(cwd string, limit int) ([]CodexSession, error) {
 
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			slog.Warn("error accessing path during session scan", "path", path, "error", err)
 			return nil
 		}
 		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
@@ -171,7 +182,7 @@ func readCodexSessionMeta(path string) (CodexSession, bool) {
 		return CodexSession{}, false
 	}
 
-	line, err := readFirstLine(bytes.NewReader(data))
+	line, err := readFirstLine(bytes.NewReader(data), 1024*1024)
 	if err != nil || len(line) == 0 {
 		return CodexSession{}, false
 	}
@@ -243,10 +254,10 @@ func dedupeCodexSessions(sessions []CodexSession) []CodexSession {
 	return deduped
 }
 
-func readFirstLine(r io.Reader) ([]byte, error) {
+func readFirstLine(r io.Reader, maxLen int) ([]byte, error) {
 	var buf bytes.Buffer
 	tmp := make([]byte, 4096)
-	for {
+	for buf.Len() < maxLen {
 		n, err := r.Read(tmp)
 		if n > 0 {
 			if idx := bytes.IndexByte(tmp[:n], '\n'); idx >= 0 {
@@ -262,6 +273,7 @@ func readFirstLine(r io.Reader) ([]byte, error) {
 			return nil, err
 		}
 	}
+	return buf.Bytes(), fmt.Errorf("first line exceeds maximum length of %d bytes", maxLen)
 }
 
 func repoName(repositoryURL, cwd string) string {
@@ -281,7 +293,12 @@ func repoName(repositoryURL, cwd string) string {
 
 func detectCodexSessionModel(data []byte) string {
 	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
+	maxLines := 10
+	if len(lines) < maxLines {
+		maxLines = len(lines)
+	}
+	for i := 0; i < maxLines; i++ {
+		line := lines[i]
 		if len(line) == 0 {
 			continue
 		}
