@@ -308,7 +308,14 @@ func normalizeCloudResponsesInput(raw json.RawMessage, model string) (json.RawMe
 	if len(raw) == 0 {
 		return raw, nil
 	}
-
+	// Fast pre-check: if the raw JSON is smaller than 3× the compaction
+	// threshold (in bytes), it cannot possibly exceed the token threshold.
+	// This avoids the cost of unmarshal + re-marshal for the vast majority
+	// of requests that are well below the compaction limit.
+	threshold := cloudResponsesInputCompactThreshold(model)
+	if len(raw) < threshold*3 {
+		return raw, nil
+	}
 	var items []map[string]any
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return raw, nil
@@ -901,6 +908,11 @@ func copySanitizedResponsesEventStream(dst http.ResponseWriter, src io.Reader, m
 	nextLine:
 
 		if err != nil {
+			// A canceled context means the client disconnected. Treat this as a
+			// clean close rather than an error to avoid noisy warning logs.
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
 			if err == io.EOF {
 				if !sawDoneSentinel {
 					if _, writeErr := dst.Write([]byte("event: done\n")); writeErr != nil {

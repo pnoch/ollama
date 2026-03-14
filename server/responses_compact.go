@@ -187,7 +187,7 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 	// recent real messages remain the last thing the model sees. Placing the
 	// summary after preservedTail caused the model to treat the summary as
 	// the latest assistant turn and lose track of the active task.
-	if summaryText := buildCompactionSummary(summaryParts, omittedCounts); summaryText != "" {
+	if summaryText := buildCompactionSummaryWithTurnCount(summaryParts, omittedCounts, len(compactedHead)); summaryText != "" {
 		output = append(output, makeResponsesAssistantMessage(summaryText))
 	}
 	output = append(output, preservedTail...)
@@ -244,12 +244,45 @@ func splitCompactedTailWithBudget(items []map[string]any, chunkMax, charMax int)
 }
 
 func responsesCompactTailBudget(model string) (chunkMax, charMax int) {
+	// Default tail budget for unknown or small-context models.
 	chunkMax = responsesCompactRecentTailMaxChunks
 	charMax = responsesCompactRecentTailMaxChars
-	if limit, ok := lookupCloudModelLimit(model); ok && limit.Context >= 200_000 {
-		return 5, 2600
+
+	limit, ok := lookupCloudModelLimit(model)
+	if !ok || limit.Context <= 0 {
+		return chunkMax, charMax
 	}
-	return chunkMax, charMax
+
+	// Scale the char budget to ~0.8% of the model context window (in chars,
+	// approximating 3 chars/token). This gives larger-context models a
+	// proportionally bigger preserved tail without wasting context on small
+	// models.
+	//
+	// Examples:
+	//   32k  context → ~768  chars  (≈ 256 tokens)
+	//   128k context → ~3072 chars  (≈ 1024 tokens)
+	//   200k context → ~4800 chars  (≈ 1600 tokens)
+	//   262k context → ~6291 chars  (≈ 2097 tokens)
+	scaledChars := limit.Context * 3 / 400 // 0.75% of context in chars
+	if scaledChars < responsesCompactRecentTailMaxChars {
+		scaledChars = responsesCompactRecentTailMaxChars
+	}
+	const maxTailChars = 8000
+	if scaledChars > maxTailChars {
+		scaledChars = maxTailChars
+	}
+
+	// Scale chunks: 1 extra chunk per 64k of context beyond the first 32k.
+	scaledChunks := responsesCompactRecentTailMaxChunks + (limit.Context-32_000)/64_000
+	if scaledChunks < responsesCompactRecentTailMaxChunks {
+		scaledChunks = responsesCompactRecentTailMaxChunks
+	}
+	const maxTailChunks = 8
+	if scaledChunks > maxTailChunks {
+		scaledChunks = maxTailChunks
+	}
+
+	return scaledChunks, scaledChars
 }
 
 func responsesStructuredChunkBudget(model string) int {
@@ -988,11 +1021,19 @@ func summarizeCompactedSameRoleMessageRun(items []map[string]any, index int) (su
 }
 
 func buildCompactionSummary(parts []string, omittedCounts map[string]int) string {
+	return buildCompactionSummaryWithTurnCount(parts, omittedCounts, 0)
+}
+
+func buildCompactionSummaryWithTurnCount(parts []string, omittedCounts map[string]int, turnCount int) string {
 	if len(parts) == 0 && len(omittedCounts) == 0 {
 		return ""
 	}
-
-	const compactedHistoryPrefix = "Previous conversation history was compacted by Ollama.\n\n"
+	var compactedHistoryPrefix string
+	if turnCount > 0 {
+		compactedHistoryPrefix = fmt.Sprintf("Previous conversation history was compacted by Ollama (summarising %d turns).\n\n", turnCount)
+	} else {
+		compactedHistoryPrefix = "Previous conversation history was compacted by Ollama.\n\n"
+	}
 	const preservedSummaryHeader = "Preserved summary:\n"
 
 	var b strings.Builder

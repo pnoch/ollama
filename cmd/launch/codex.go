@@ -242,19 +242,22 @@ func dedupeCodexSessions(sessions []CodexSession) []CodexSession {
 	if len(sessions) == 0 {
 		return sessions
 	}
-	// Use a smaller initial capacity: duplicates are rare so we avoid
-	// allocating a full-size map and slice in the common no-duplicate case.
-	initCap := len(sessions)/2 + 1
-	seen := make(map[string]struct{}, initCap)
-	deduped := make([]CodexSession, 0, len(sessions))
+	// Use a nil out-slice and lazy append so no allocation occurs when there
+	// are no duplicates (the common case). The seen map uses a conservative
+	// initial capacity since duplicates are rare.
+	seen := make(map[string]struct{}, len(sessions)/2+1)
+	var out []CodexSession
 	for _, session := range sessions {
-		if _, ok := seen[session.ID]; ok {
+		if _, dup := seen[session.ID]; dup {
 			continue
 		}
 		seen[session.ID] = struct{}{}
-		deduped = append(deduped, session)
+		out = append(out, session)
 	}
-	return deduped
+	if out == nil {
+		return sessions
+	}
+	return out
 }
 
 func readFirstLine(r io.Reader, maxLen int) ([]byte, error) {
