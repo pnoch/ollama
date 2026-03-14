@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
@@ -345,7 +346,7 @@ func CompletionsMiddleware() gin.HandlerFunc {
 		w := &CompleteWriter{
 			BaseWriter:    BaseWriter{ResponseWriter: c.Writer},
 			stream:        req.Stream,
-			id:            fmt.Sprintf("cmpl-%d", rand.Intn(999)),
+			id:            fmt.Sprintf("cmpl-%s", uuid.New().String()[:8]),
 			streamOptions: req.StreamOptions,
 		}
 
@@ -437,7 +438,7 @@ func ChatMiddleware() gin.HandlerFunc {
 		w := &ChatWriter{
 			BaseWriter:    BaseWriter{ResponseWriter: c.Writer},
 			stream:        req.Stream,
-			id:            fmt.Sprintf("chatcmpl-%d", rand.Intn(999)),
+			id:            fmt.Sprintf("chatcmpl-%s", uuid.New().String()[:8]),
 			streamOptions: req.StreamOptions,
 		}
 
@@ -568,8 +569,8 @@ func ResponsesMiddleware() gin.HandlerFunc {
 
 		c.Request.Body = io.NopCloser(&b)
 
-		responseID := fmt.Sprintf("resp_%d", rand.Intn(999999))
-		itemID := fmt.Sprintf("msg_%d", rand.Intn(999999))
+		responseID := fmt.Sprintf("resp_%s", uuid.New().String())
+		itemID := fmt.Sprintf("msg_%s", uuid.New().String()[:8])
 
 		w := &ResponsesWriter{
 			BaseWriter: BaseWriter{ResponseWriter: c.Writer},

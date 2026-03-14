@@ -529,12 +529,10 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 
 	if r.TopP != nil {
 		options["top_p"] = *r.TopP
-	} else { //nolint:staticcheck // SA9003: empty branch
-		// TODO(drifkin): OpenAI defaults to 1.0 here, but we don't follow that here
-		// in case the model has a different default. It would be best if we
-		// understood whether there was a model-specific default and if not, we
-		// should also default to 1.0, but that will require some additional
-		// plumbing
+	} else {
+		// Default to 1.0 per OpenAI spec. This matches the value already used
+		// in the response object and avoids model-specific default drift.
+		options["top_p"] = 1.0
 	}
 
 	if r.MaxOutputTokens != nil {
@@ -543,14 +541,26 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 
 	// Parse tool_choice to determine how to handle tools.
 	// Supported values:
-	//   "none"     → strip all tools so the model cannot call any
-	//   "required" → inject a system suffix instructing the model to call a tool
-	//   anything else ("auto", named function, etc.) → no special handling
+	//   "none"                          → strip all tools so the model cannot call any
+	//   "required"                      → inject a system suffix instructing the model to call a tool
+	//   {type:"function", name:"X"}     → inject a system suffix naming the specific tool to call
+	//   anything else ("auto")          → no special handling
 	toolChoiceStr := ""
+	toolChoiceNamedFunc := ""
 	if len(r.ToolChoice) > 0 {
 		// ToolChoice can be a plain string or an object {type, name}.
 		// Try plain string first.
-		_ = json.Unmarshal(r.ToolChoice, &toolChoiceStr)
+		if err := json.Unmarshal(r.ToolChoice, &toolChoiceStr); err != nil {
+			// Try object form: {"type": "function", "name": "tool_name"}
+			var tcObj struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(r.ToolChoice, &tcObj) == nil && tcObj.Type == "function" && tcObj.Name != "" {
+				toolChoiceStr = "required"
+				toolChoiceNamedFunc = tcObj.Name
+			}
+		}
 	}
 
 	// Convert tools from Responses API format to api.Tool format
@@ -564,14 +574,23 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 			tools = append(tools, tool)
 		}
 	}
-	// When tool_choice is "required", append a system message suffix that
-	// instructs the model to always respond by calling one of the provided
-	// tools. This is a best-effort approximation for local models that do not
+	// When tool_choice is "required" or a named function, append a system
+	// message suffix that instructs the model to call a specific tool (or any
+	// tool). This is a best-effort approximation for local models that do not
 	// natively support tool_choice enforcement.
 	if toolChoiceStr == "required" && len(tools) > 0 {
+		var suffixContent string
+		if toolChoiceNamedFunc != "" {
+			suffixContent = fmt.Sprintf(
+				"You must respond by calling the %q tool. Do not reply with plain text or call any other tool.",
+				toolChoiceNamedFunc,
+			)
+		} else {
+			suffixContent = "You must respond by calling one of the provided tools. Do not reply with plain text."
+		}
 		suffix := api.Message{
 			Role:    "system",
-			Content: "You must respond by calling one of the provided tools. Do not reply with plain text.",
+			Content: suffixContent,
 		}
 		// Insert after any existing system/developer messages at the front.
 		insertAt := 0
@@ -882,7 +901,15 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 		Output:             output,
 		Error:              nil, // Only populated on failure
 		Tools:              tools,
-		ToolChoice:         "auto", // Default value
+		ToolChoice: func() any {
+			if len(request.ToolChoice) > 0 {
+				var v any
+				if json.Unmarshal(request.ToolChoice, &v) == nil {
+					return v
+				}
+			}
+			return "auto"
+		}(), // Echo back the request's tool_choice, defaulting to "auto"
 		Truncation:         truncation,
 		ParallelToolCalls:  true, // Default value
 		Text:               text,
@@ -896,10 +923,12 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 			InputTokens:  chatResponse.PromptEvalCount,
 			OutputTokens: chatResponse.EvalCount,
 			TotalTokens:  chatResponse.PromptEvalCount + chatResponse.EvalCount,
-			// TODO(drifkin): wire through the actual values
 			InputTokensDetails: ResponsesInputTokensDetails{CachedTokens: 0},
-			// TODO(drifkin): wire through the actual values
-			OutputTokensDetails: ResponsesOutputTokensDetails{ReasoningTokens: 0},
+			// Ollama does not report thinking tokens separately; estimate from
+			// the thinking text length using the standard ~4 chars/token heuristic.
+			OutputTokensDetails: ResponsesOutputTokensDetails{
+				ReasoningTokens: len([]rune(chatResponse.Message.Thinking)) / 4,
+			},
 		},
 		MaxOutputTokens:  request.MaxOutputTokens,
 		MaxToolCalls:     nil,   // Not supported
@@ -1094,7 +1123,15 @@ func (c *ResponsesStreamConverter) buildResponseObject(status string, output []a
 		"output":               output,
 		"error":                nil,
 		"tools":                tools,
-		"tool_choice":          "auto",
+		"tool_choice": func() any {
+			if len(c.request.ToolChoice) > 0 {
+				var v any
+				if json.Unmarshal(c.request.ToolChoice, &v) == nil {
+					return v
+				}
+			}
+			return "auto"
+		}(),
 		"truncation":           truncation,
 		"parallel_tool_calls":  true,
 		"text":                 map[string]any{"format": textFormat},
@@ -1404,7 +1441,8 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 			"cached_tokens": 0,
 		},
 		"output_tokens_details": map[string]any{
-			"reasoning_tokens": 0,
+			// Estimate reasoning tokens from accumulated thinking text.
+			"reasoning_tokens": len([]rune(c.accumulatedThinking)) / 4,
 		},
 	}
 	response := c.buildResponseObject("completed", c.buildFinalOutput(), usage)
