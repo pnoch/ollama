@@ -141,7 +141,9 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 			continue
 		}
 		if combined, nextIndex, ok := summarizeCompactedMessageRun(compactedHead, i); ok {
-			summaryParts = append(summaryParts, combined)
+			if !summaryDuplicatesPreserved(combined, preservedTail) {
+				summaryParts = append(summaryParts, combined)
+			}
 			i = nextIndex
 			continue
 		}
@@ -867,12 +869,22 @@ func summarizeCompactedMessageRun(items []map[string]any, index int) (summary st
 func roleLabel(role string) string {
 	switch role {
 	case "assistant":
-		return "Assistant"
+		return "Asst"
 	case "user":
 		return "User"
 	default:
 		return role
 	}
+}
+
+func summaryDuplicatesPreserved(summary string, preservedTail []map[string]any) bool {
+	for _, item := range preservedTail {
+		text := extractResponsesItemText(item["content"])
+		if text != "" && strings.Contains(summary, text) {
+			return true
+		}
+	}
+	return false
 }
 
 func summarizeCompactedSameRoleMessageRun(items []map[string]any, index int) (summary string, nextIndex int, ok bool) {
