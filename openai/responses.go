@@ -180,6 +180,30 @@ type ResponsesReasoningInput struct {
 
 func (ResponsesReasoningInput) responsesInputItem() {}
 
+// ResponsesWebSearchCall represents a web search call in conversation history.
+type ResponsesWebSearchCall struct {
+	Type   string `json:"type"` // always "web_search_call"
+	Status string `json:"status,omitempty"`
+	Action struct {
+		Type  string `json:"type"`
+		Query string `json:"query,omitempty"`
+	} `json:"action"`
+}
+
+func (ResponsesWebSearchCall) responsesInputItem() {}
+
+// ResponsesImageGenerationCall represents an image generation call in conversation history.
+type ResponsesImageGenerationCall struct {
+	Type   string `json:"type"` // always "image_generation_call"
+	Status string `json:"status,omitempty"`
+	Action struct {
+		Type   string `json:"type"`
+		Prompt string `json:"prompt,omitempty"`
+	} `json:"action"`
+}
+
+func (ResponsesImageGenerationCall) responsesInputItem() {}
+
 // unmarshalResponsesInputItem unmarshals a single input item from JSON.
 func unmarshalResponsesInputItem(data []byte) (ResponsesInputItem, error) {
 	var typeField struct {
@@ -234,6 +258,18 @@ func unmarshalResponsesInputItem(data []byte) (ResponsesInputItem, error) {
 			return nil, err
 		}
 		return reasoning, nil
+	case "web_search_call":
+		var ws ResponsesWebSearchCall
+		if err := json.Unmarshal(data, &ws); err != nil {
+			return nil, err
+		}
+		return ws, nil
+	case "image_generation_call":
+		var ig ResponsesImageGenerationCall
+		if err := json.Unmarshal(data, &ig); err != nil {
+			return nil, err
+		}
+		return ig, nil
 	default:
 		return nil, fmt.Errorf("unknown input item type: %s", typeField.Type)
 	}

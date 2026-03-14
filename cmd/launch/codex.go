@@ -52,7 +52,10 @@ func (c *Codex) Run(model string, args []string) error {
 
 	cmdArgs := c.args(model, args)
 	catalogArg, cleanup, err := codexModelCatalogArg(model)
-	if err == nil && catalogArg != "" {
+	if err != nil {
+		return fmt.Errorf("failed to prepare codex model catalog: %w", err)
+	}
+	if catalogArg != "" {
 		cmdArgs = append(cmdArgs[:len(cmdArgs)-len(args)], append([]string{"-c", catalogArg}, cmdArgs[len(cmdArgs)-len(args):]...)...)
 	}
 	if cleanup != nil {

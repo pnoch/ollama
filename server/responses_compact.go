@@ -729,8 +729,6 @@ func candidateBoundaryUserToolAssistantRun(compactedHead, preservedTail []map[st
 		return structuredCompactionCandidate{}, false
 	}
 	user := compactedHead[len(compactedHead)-3]
-	tool := compactedHead[len(compactedHead)-2]
-	toolOut := compactedHead[len(compactedHead)-1]
 	firstTail := preservedTail[0]
 	if normalizeResponsesItemType(user) != "message" || normalizeResponsesItemType(firstTail) != "message" {
 		return structuredCompactionCandidate{}, false
@@ -747,8 +745,6 @@ func candidateBoundaryUserToolAssistantRun(compactedHead, preservedTail []map[st
 	if extractResponsesItemText(user["content"]) == "" || extractResponsesItemText(firstTail["content"]) == "" {
 		return structuredCompactionCandidate{}, false
 	}
-	_ = tool
-	_ = toolOut
 	return structuredCompactionCandidate{
 		structured: append([]map[string]any{user}, append(pair, firstTail)...),
 		headStart:  len(compactedHead) - 3,
