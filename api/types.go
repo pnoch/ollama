@@ -164,6 +164,14 @@ type ChatRequest struct {
 	// Tools is an optional list of tools the model has access to.
 	Tools `json:"tools,omitempty"`
 
+	// ToolChoice controls which tool (if any) the model is forced to call.
+	// Accepted values:
+	//   "auto"     - model decides (default when tools are provided)
+	//   "none"     - model must not call any tool
+	//   "required" - model must call at least one tool
+	//   {"type":"function","function":{"name":"X"}} - model must call tool X
+	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
+
 	// Options lists model-specific options.
 	Options map[string]any `json:"options"`
 

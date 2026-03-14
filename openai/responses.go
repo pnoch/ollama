@@ -381,9 +381,9 @@ type ResponsesRequest struct {
 	Tools []ResponsesTool `json:"tools,omitempty"`
 
 	// optional: "auto" | "none" | "required" | {type: "function", name: string}
-	// "none"     → strip all tools from the chat request
-	// "required" → append a system prompt suffix instructing the model to call a tool
-	// other      → passed through as-is (best-effort)
+	// Passed through to api.ChatRequest.ToolChoice; the core server applies
+	// grammar-constrained generation (GBNF via llama.SchemaToGrammar) and a
+	// belt-and-suspenders system message for "required" / named function choices.
 	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
 
 	// optional, default is false
@@ -539,65 +539,17 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 		options["num_predict"] = *r.MaxOutputTokens
 	}
 
-	// Parse tool_choice to determine how to handle tools.
-	// Supported values:
-	//   "none"                          → strip all tools so the model cannot call any
-	//   "required"                      → inject a system suffix instructing the model to call a tool
-	//   {type:"function", name:"X"}     → inject a system suffix naming the specific tool to call
-	//   anything else ("auto")          → no special handling
-	toolChoiceStr := ""
-	toolChoiceNamedFunc := ""
-	if len(r.ToolChoice) > 0 {
-		// ToolChoice can be a plain string or an object {type, name}.
-		// Try plain string first.
-		if err := json.Unmarshal(r.ToolChoice, &toolChoiceStr); err != nil {
-			// Try object form: {"type": "function", "name": "tool_name"}
-			var tcObj struct {
-				Type string `json:"type"`
-				Name string `json:"name"`
-			}
-			if json.Unmarshal(r.ToolChoice, &tcObj) == nil && tcObj.Type == "function" && tcObj.Name != "" {
-				toolChoiceStr = "required"
-				toolChoiceNamedFunc = tcObj.Name
-			}
-		}
-	}
-
-	// Convert tools from Responses API format to api.Tool format
+	// Convert tools from Responses API format to api.Tool format.
+	// tool_choice is passed through to api.ChatRequest.ToolChoice so that the
+	// core server can apply grammar-constrained generation (GBNF via
+	// llama.SchemaToGrammar) and system-message enforcement at the sampler level.
 	var tools []api.Tool
-	if toolChoiceStr != "none" {
-		for _, t := range r.Tools {
-			tool, err := convertTool(t)
-			if err != nil {
-				return nil, err
-			}
-			tools = append(tools, tool)
+	for _, t := range r.Tools {
+		tool, err := convertTool(t)
+		if err != nil {
+			return nil, err
 		}
-	}
-	// When tool_choice is "required" or a named function, append a system
-	// message suffix that instructs the model to call a specific tool (or any
-	// tool). This is a best-effort approximation for local models that do not
-	// natively support tool_choice enforcement.
-	if toolChoiceStr == "required" && len(tools) > 0 {
-		var suffixContent string
-		if toolChoiceNamedFunc != "" {
-			suffixContent = fmt.Sprintf(
-				"You must respond by calling the %q tool. Do not reply with plain text or call any other tool.",
-				toolChoiceNamedFunc,
-			)
-		} else {
-			suffixContent = "You must respond by calling one of the provided tools. Do not reply with plain text."
-		}
-		suffix := api.Message{
-			Role:    "system",
-			Content: suffixContent,
-		}
-		// Insert after any existing system/developer messages at the front.
-		insertAt := 0
-		for insertAt < len(messages) && (messages[insertAt].Role == "system" || messages[insertAt].Role == "developer") {
-			insertAt++
-		}
-		messages = append(messages[:insertAt], append([]api.Message{suffix}, messages[insertAt:]...)...)
+		tools = append(tools, tool)
 	}
 
 	// Handle text format (e.g. json_schema)
@@ -612,11 +564,12 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 	}
 
 	return &api.ChatRequest{
-		Model:    r.Model,
-		Messages: messages,
-		Options:  options,
-		Tools:    tools,
-		Format:   format,
+		Model:      r.Model,
+		Messages:   messages,
+		Options:    options,
+		Tools:      tools,
+		Format:     format,
+		ToolChoice: r.ToolChoice, // passed through for core grammar-constrained enforcement
 	}, nil
 }
 

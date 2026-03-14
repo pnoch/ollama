@@ -2355,6 +2355,32 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		toolParser = tools.NewParser(m.Template.Template, req.Tools)
 	}
 
+	// Parse tool_choice and apply grammar-constrained generation when required.
+	// For "required" or named function: build a JSON Schema for the tool call
+	// shape and set it as req.Format so llm/server.go converts it to a GBNF
+	// grammar via llama.SchemaToGrammar, constraining token sampling at the
+	// sampler level. Also inject a system message as a belt-and-suspenders hint.
+	// For "none": strip all tools so the model cannot call any.
+	parsedToolChoice := tools.ParseToolChoice(req.ToolChoice)
+	if len(req.Tools) > 0 {
+		switch parsedToolChoice.Kind {
+		case tools.ToolChoiceRequired, tools.ToolChoiceNamed:
+			if req.Format == nil {
+				if schemaBytes := tools.ToolChoiceGrammarSchema(parsedToolChoice, []api.Tool(req.Tools)); schemaBytes != nil {
+					req.Format = json.RawMessage(schemaBytes)
+					slog.Debug("tool_choice grammar schema applied",
+						"choice", tools.ToolChoiceDescription(parsedToolChoice),
+						"schema_len", len(schemaBytes))
+				}
+			}
+			msgs = tools.InjectToolChoiceSystemMessage(msgs, parsedToolChoice)
+		case tools.ToolChoiceNone:
+			req.Tools = nil
+			processedTools = nil
+			toolParser = nil
+		}
+	}
+
 	type structuredOutputsState int
 	const (
 		structuredOutputsState_None structuredOutputsState = iota
