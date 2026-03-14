@@ -308,19 +308,14 @@ func normalizeCloudResponsesInput(raw json.RawMessage, model string) (json.RawMe
 	if len(raw) == 0 {
 		return raw, nil
 	}
-	// Fast pre-check: if the raw JSON is smaller than 3× the compaction
-	// threshold (in bytes), it cannot possibly exceed the token threshold.
-	// This avoids the cost of unmarshal + re-marshal for the vast majority
-	// of requests that are well below the compaction limit.
-	threshold := cloudResponsesInputCompactThreshold(model)
-	if len(raw) < threshold*3 {
-		return raw, nil
-	}
+
 	var items []map[string]any
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return raw, nil
 	}
 
+	// Always run the normalization/sanitization pass regardless of size.
+	// The pre-check below only guards the more expensive compaction step.
 	normalized := make([]map[string]any, 0, len(items))
 	for _, item := range items {
 		expanded, err := normalizeCloudResponsesInputItem(item)
@@ -332,7 +327,13 @@ func normalizeCloudResponsesInput(raw json.RawMessage, model string) (json.RawMe
 
 	estimatedTokens := estimateResponsesInputTokens(normalized)
 	threshold := cloudResponsesInputCompactThreshold(model)
-	if estimatedTokens <= threshold {
+
+	// Fast path: if the estimated token count is well below the compaction
+	// threshold, skip the more expensive compaction step entirely. We use 2×
+	// the byte length as a conservative guard: code-heavy JSON with short
+	// tokens can have a byte/token ratio close to 1, so a larger multiplier
+	// could cause compaction to be skipped when it should fire.
+	if len(raw) < threshold*2 || estimatedTokens <= threshold {
 		return json.Marshal(normalized)
 	}
 
@@ -908,9 +909,10 @@ func copySanitizedResponsesEventStream(dst http.ResponseWriter, src io.Reader, m
 	nextLine:
 
 		if err != nil {
-			// A canceled context means the client disconnected. Treat this as a
-			// clean close rather than an error to avoid noisy warning logs.
-			if errors.Is(err, context.Canceled) {
+			// A canceled context or a closed network connection means the client
+			// disconnected. Treat both as a clean close rather than an error to
+			// avoid noisy warning logs on normal client disconnects.
+			if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			if err == io.EOF {

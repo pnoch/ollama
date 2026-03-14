@@ -183,11 +183,22 @@ func compactResponsesInputForModel(raw json.RawMessage, model string) ([]map[str
 		}
 	}
 	output = append(output, structuredPreserved...)
+	// Count turns as the number of user messages in compactedHead.
+	// Using len(compactedHead) would over-count because each turn can span
+	// multiple items (function_call, function_call_output, assistant message).
+	turnCount := 0
+	for _, item := range compactedHead {
+		if normalizeResponsesItemType(item) == "message" {
+			if role, _ := item["role"].(string); role == "user" {
+				turnCount++
+			}
+		}
+	}
 	// Insert the compaction summary BEFORE preservedTail so that the most
 	// recent real messages remain the last thing the model sees. Placing the
 	// summary after preservedTail caused the model to treat the summary as
 	// the latest assistant turn and lose track of the active task.
-	if summaryText := buildCompactionSummaryWithTurnCount(summaryParts, omittedCounts, len(compactedHead)); summaryText != "" {
+	if summaryText := buildCompactionSummaryWithTurnCount(summaryParts, omittedCounts, turnCount); summaryText != "" {
 		output = append(output, makeResponsesAssistantMessage(summaryText))
 	}
 	output = append(output, preservedTail...)
@@ -286,8 +297,22 @@ func responsesCompactTailBudget(model string) (chunkMax, charMax int) {
 }
 
 func responsesStructuredChunkBudget(model string) int {
-	if limit, ok := lookupCloudModelLimit(model); ok && limit.Context >= 200_000 {
-		return 2
+	// Scale the structured chunk budget proportionally with context window:
+	//   < 64k  context → 1 structured chunk
+	//   64k–128k       → 2 structured chunks
+	//   128k–256k      → 3 structured chunks
+	//   256k+          → 4 structured chunks
+	// This ensures large-context models can preserve more structured tool
+	// exchanges verbatim rather than summarising them.
+	if limit, ok := lookupCloudModelLimit(model); ok && limit.Context > 0 {
+		switch {
+		case limit.Context >= 256_000:
+			return 4
+		case limit.Context >= 128_000:
+			return 3
+		case limit.Context >= 64_000:
+			return 2
+		}
 	}
 	return 1
 }
