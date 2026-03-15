@@ -501,6 +501,8 @@ func (w *ResponsesWriter) writeResponse(data []byte) (int, error) {
 
 // writeResponseWithWebSearch builds a non-streaming Responses API response that
 // includes a web_search_call output item before the final assistant message.
+// It also extracts url_citation annotations from the response text and injects
+// them into the output_text content per the OpenAI Responses API spec.
 func (w *ResponsesWriter) writeResponseWithWebSearch(data []byte, wsItemID, query string, results []map[string]any) (int, error) {
 	var chatResponse api.ChatResponse
 	if err := json.Unmarshal(data, &chatResponse); err != nil {
@@ -510,6 +512,8 @@ func (w *ResponsesWriter) writeResponseWithWebSearch(data []byte, wsItemID, quer
 	response := openai.ToResponse(w.model, w.responseID, w.itemID, chatResponse, w.request)
 	completedAt := time.Now().Unix()
 	response.CompletedAt = &completedAt
+	// Inject url_citation annotations into output_text content items.
+	injectWebSearchCitations(response.Output, results)
 	// Prepend the web_search_call output item.
 	wsItem := openai.ResponsesOutputItem{
 		ID:     wsItemID,
@@ -518,6 +522,30 @@ func (w *ResponsesWriter) writeResponseWithWebSearch(data []byte, wsItemID, quer
 	}
 	response.Output = append([]openai.ResponsesOutputItem{wsItem}, response.Output...)
 	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
+}
+
+// injectWebSearchCitations scans each output_text content item in the output
+// list for citation markers (e.g. [1], [Source 2]) and replaces the empty
+// annotations slice with url_citation objects that point to the search results.
+func injectWebSearchCitations(output []openai.ResponsesOutputItem, results []map[string]any) {
+	for i := range output {
+		if output[i].Type != "message" {
+			continue
+		}
+		for j := range output[i].Content {
+			if output[i].Content[j].Type != "output_text" {
+				continue
+			}
+			citations := openai.ExtractWebSearchCitations(output[i].Content[j].Text, results)
+			if len(citations) > 0 {
+				anns := make([]any, len(citations))
+				for k, c := range citations {
+					anns[k] = c
+				}
+				output[i].Content[j].Annotations = anns
+			}
+		}
+	}
 }
 
 // writeResponseWithFileSearch builds a non-streaming Responses API response

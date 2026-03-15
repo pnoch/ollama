@@ -231,8 +231,11 @@ func TestCodexRightOpensSessionPicker(t *testing.T) {
 	if !got.showingSessionModal {
 		t.Fatal("expected showingSessionModal=true after right on codex")
 	}
-	if len(got.sessionSelector.items) != 1 {
-		t.Fatalf("len(sessionSelector.items) = %d, want 1 (openai session should be filtered)", len(got.sessionSelector.items))
+	// Both the Ollama session and the cross-provider OpenAI session should now
+	// appear in the picker (2 items total). The OpenAI session is placed after
+	// the Ollama session in the "Other Sessions (cross-provider)" section.
+	if len(got.sessionSelector.items) != 2 {
+		t.Fatalf("len(sessionSelector.items) = %d, want 2 (ollama + cross-provider session)", len(got.sessionSelector.items))
 	}
 	if got.sessionSelector.items[0].Value != "session-123" {
 		t.Fatalf("session value = %q, want session-123", got.sessionSelector.items[0].Value)
@@ -246,8 +249,15 @@ func TestCodexRightOpensSessionPicker(t *testing.T) {
 	if got.sessionSelector.recommendedHeader != "Matching Model" {
 		t.Fatalf("recommendedHeader = %q, want Matching Model", got.sessionSelector.recommendedHeader)
 	}
-	if got.sessionSelector.otherHeader != "Other Sessions" {
-		t.Fatalf("otherHeader = %q, want Other Sessions", got.sessionSelector.otherHeader)
+	if got.sessionSelector.otherHeader != "Other Sessions (cross-provider)" {
+		t.Fatalf("otherHeader = %q, want \"Other Sessions (cross-provider)\"", got.sessionSelector.otherHeader)
+	}
+	// The second item should be the cross-provider OpenAI session.
+	if got.sessionSelector.items[1].Value != "session-999" {
+		t.Fatalf("items[1].Value = %q, want session-999 (cross-provider session)", got.sessionSelector.items[1].Value)
+	}
+	if got.sessionSelector.items[1].Recommended {
+		t.Fatal("cross-provider session should not be marked as recommended")
 	}
 	_ = cwd // used in session data
 }

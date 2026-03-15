@@ -283,40 +283,59 @@ func (m *model) openCodexSessionModal(selectedModel string) {
 		return
 	}
 
-	sessions, err := launch.ListCodexSessions(cwd, 30)
+	// Fetch all sessions without a cwd filter so that cross-provider sessions
+	// from other directories are also available. We apply the cwd filter
+	// ourselves below: Ollama sessions are scoped to the current project
+	// directory, while cross-provider sessions are shown globally (they will
+	// be normalised by cloud_proxy.go on resume regardless of origin cwd).
+	allSessions, err := launch.ListCodexSessions("", 60)
 	if err != nil {
 		m.statusMsg = "Unable to read Codex sessions."
 		return
 	}
-	if len(sessions) == 0 {
+	if len(allSessions) == 0 {
 		m.statusMsg = fmt.Sprintf("No Codex sessions found in %s", cwd)
 		return
 	}
 
-
-	items := make([]SelectItem, len(sessions))
-	var count int
-	for _, session := range sessions {
-		// Skip sessions from non-Ollama providers (e.g. openai) since they
-		// cannot be resumed against a local Ollama model.
-		if session.Provider != "" && session.Provider != "ollama" {
-			continue
+	// Separate Ollama sessions (directly resumable, scoped to cwd) from
+	// non-Ollama sessions (cross-provider resume — shown globally).
+	var ollamaItems, otherItems []SelectItem
+	for _, session := range allSessions {
+		// Ollama sessions: only show those from the current working directory.
+		if session.Provider == "" || session.Provider == "ollama" {
+			if session.CWD != cwd {
+				continue
+			}
+			recommended := selectedModel != "" && session.Model != "" && session.Model == selectedModel
+			name := session.Title
+			if session.Model != "" {
+				name = fmt.Sprintf("%s  [%s]", name, session.Model)
+			}
+			ollamaItems = append(ollamaItems, SelectItem{
+				Name:        name,
+				Value:       session.ID,
+				Description: session.Description,
+				Recommended: recommended,
+			})
+		} else {
+			// Cross-provider sessions are shown globally and are never pinned
+			// as "recommended" since the model name won't match the local one.
+			name := session.Title
+			if session.Model != "" {
+				name = fmt.Sprintf("%s  [%s]", name, session.Model)
+			}
+			otherItems = append(otherItems, SelectItem{
+				Name:        name,
+				Value:       session.ID,
+				Description: session.Description,
+				Recommended: false,
+			})
 		}
-		recommended := selectedModel != "" && session.Model != "" && session.Model == selectedModel
-		name := session.Title
-		if session.Model != "" {
-			name = fmt.Sprintf("%s  [%s]", name, session.Model)
-		}
-		items[count] = SelectItem{
-			Name:        name,
-			Value:       session.ID,
-			Description: session.Description,
-			Recommended: recommended,
-		}
-		count++
 	}
-	items = items[:count]
-	if len(items) == 0 {
+	// Combine: Ollama sessions first (with model-match pinning), then cross-provider.
+	allItems := append(ReorderItems(ollamaItems), otherItems...)
+	if len(allItems) == 0 {
 		m.statusMsg = "No Codex sessions found."
 		return
 	}
@@ -324,12 +343,16 @@ func (m *model) openCodexSessionModal(selectedModel string) {
 	if selectedModel != "" {
 		title = fmt.Sprintf("Resume Codex session for %s:", selectedModel)
 	}
+	otherHeader := "Other Sessions"
+	if len(otherItems) > 0 {
+		otherHeader = "Other Sessions (cross-provider)"
+	}
 	m.sessionSelector = selectorModel{
 		title:             title,
-		items:             ReorderItems(items),
+		items:             allItems,
 		helpText:          "\u2191/\u2193 navigate \u2022 enter resume \u2022 matching model sessions pinned first \u2022 \u2190 back",
 		recommendedHeader: "Matching Model",
-		otherHeader:       "Other Sessions",
+		otherHeader:       otherHeader,
 	}
 	m.showingSessionModal = true
 }

@@ -2278,3 +2278,152 @@ func TestResponsesStreamConverter_FileSearchCallEvents(t *testing.T) {
 		t.Errorf("toolCallItems len = %d, want 1", len(c.toolCallItems))
 	}
 }
+
+// ─── ExtractWebSearchCitations ───────────────────────────────────────────────
+
+func TestExtractWebSearchCitations_NoResults(t *testing.T) {
+got := ExtractWebSearchCitations("Some text [1]", nil)
+if got != nil {
+t.Errorf("expected nil for empty results, got %v", got)
+}
+}
+
+func TestExtractWebSearchCitations_EmptyText(t *testing.T) {
+results := []map[string]any{
+{"url": "https://example.com", "title": "Example"},
+}
+got := ExtractWebSearchCitations("", results)
+if got != nil {
+t.Errorf("expected nil for empty text, got %v", got)
+}
+}
+
+func TestExtractWebSearchCitations_SimpleNumeric(t *testing.T) {
+results := []map[string]any{
+{"url": "https://example.com/a", "title": "Example A"},
+{"url": "https://example.com/b", "title": "Example B"},
+}
+text := "According to [1], this is true. See also [2] for more."
+got := ExtractWebSearchCitations(text, results)
+if len(got) != 2 {
+t.Fatalf("expected 2 annotations, got %d: %v", len(got), got)
+}
+if got[0].Type != "url_citation" {
+t.Errorf("annotation[0].Type = %q, want url_citation", got[0].Type)
+}
+if got[0].URL != "https://example.com/a" {
+t.Errorf("annotation[0].URL = %q, want https://example.com/a", got[0].URL)
+}
+if got[0].Title != "Example A" {
+t.Errorf("annotation[0].Title = %q, want Example A", got[0].Title)
+}
+runes := []rune(text)
+if runes[got[0].StartIndex] != '[' {
+t.Errorf("annotation[0].StartIndex %d does not point to '[', got %q", got[0].StartIndex, string(runes[got[0].StartIndex]))
+}
+if runes[got[0].EndIndex-1] != ']' {
+t.Errorf("annotation[0].EndIndex-1 %d does not point to ']', got %q", got[0].EndIndex-1, string(runes[got[0].EndIndex-1]))
+}
+if got[1].URL != "https://example.com/b" {
+t.Errorf("annotation[1].URL = %q, want https://example.com/b", got[1].URL)
+}
+}
+
+func TestExtractWebSearchCitations_SourcePrefix(t *testing.T) {
+results := []map[string]any{
+{"url": "https://example.com/a", "title": "A"},
+}
+text := "See [Source 1] for details."
+got := ExtractWebSearchCitations(text, results)
+if len(got) != 1 {
+t.Fatalf("expected 1 annotation for [Source 1], got %d", len(got))
+}
+if got[0].URL != "https://example.com/a" {
+t.Errorf("annotation.URL = %q, want https://example.com/a", got[0].URL)
+}
+}
+
+func TestExtractWebSearchCitations_OutOfRange(t *testing.T) {
+results := []map[string]any{
+{"url": "https://example.com/a", "title": "A"},
+}
+got := ExtractWebSearchCitations("See [5] for details.", results)
+if len(got) != 0 {
+t.Errorf("expected 0 annotations for out-of-range index, got %d", len(got))
+}
+}
+
+func TestExtractWebSearchCitations_MissingURL(t *testing.T) {
+results := []map[string]any{
+{"title": "No URL here"},
+}
+got := ExtractWebSearchCitations("See [1] for details.", results)
+if len(got) != 0 {
+t.Errorf("expected 0 annotations when result has no URL, got %d", len(got))
+}
+}
+
+func TestExtractWebSearchCitations_NoBrackets(t *testing.T) {
+results := []map[string]any{
+{"url": "https://example.com", "title": "Example"},
+}
+got := ExtractWebSearchCitations("No citations here at all.", results)
+if len(got) != 0 {
+t.Errorf("expected 0 annotations for text with no brackets, got %d", len(got))
+}
+}
+
+func TestWebSearchCallEvents_StoresResults(t *testing.T) {
+c := NewResponsesStreamConverter("resp_test", "msg_test", "llama3.2", ResponsesRequest{})
+results := []map[string]any{
+{"title": "Result 1", "url": "https://example.com", "content": "Some content"},
+}
+c.WebSearchCallEvents("ws_1", "test query", results)
+if len(c.webSearchResults) != 1 {
+t.Fatalf("webSearchResults len = %d, want 1", len(c.webSearchResults))
+}
+if c.webSearchResults[0]["url"] != "https://example.com" {
+t.Errorf("webSearchResults[0].url = %v, want https://example.com", c.webSearchResults[0]["url"])
+}
+}
+
+func TestProcessCompletion_InjectsCitations(t *testing.T) {
+c := NewResponsesStreamConverter("resp_test", "msg_test", "llama3.2", ResponsesRequest{})
+results := []map[string]any{
+{"title": "Example", "url": "https://example.com", "content": "content"},
+}
+c.WebSearchCallEvents("ws_1", "query", results)
+c.contentStarted = true
+c.accumulatedText = "According to [1], this is true."
+
+events := c.Process(api.ChatResponse{Done: true})
+
+var partDone map[string]any
+for _, ev := range events {
+if ev.Event == "response.content_part.done" {
+partDone, _ = ev.Data.(map[string]any)
+break
+}
+}
+if partDone == nil {
+t.Fatal("response.content_part.done event not found")
+}
+part, _ := partDone["part"].(map[string]any)
+if part == nil {
+t.Fatal("content_part.done missing part field")
+}
+anns, _ := part["annotations"].([]any)
+if len(anns) == 0 {
+t.Fatal("expected at least one annotation in content_part.done, got none")
+}
+ann, ok := anns[0].(URLCitationAnnotation)
+if !ok {
+t.Fatalf("annotation[0] type = %T, want URLCitationAnnotation", anns[0])
+}
+if ann.Type != "url_citation" {
+t.Errorf("annotation type = %q, want url_citation", ann.Type)
+}
+if ann.URL != "https://example.com" {
+t.Errorf("annotation URL = %q, want https://example.com", ann.URL)
+}
+}

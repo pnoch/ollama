@@ -833,6 +833,88 @@ type ResponsesOutputContent struct {
 	Logprobs    []any  `json:"logprobs"`
 }
 
+// URLCitationAnnotation represents an OpenAI Responses API url_citation
+// annotation that links a span of output text to a web search result.
+// See: https://platform.openai.com/docs/api-reference/responses/object
+type URLCitationAnnotation struct {
+	Type       string `json:"type"` // always "url_citation"
+	URL        string `json:"url"`
+	Title      string `json:"title"`
+	StartIndex int    `json:"start_index"`
+	EndIndex   int    `json:"end_index"`
+}
+
+// ExtractWebSearchCitations scans text for citation markers that reference
+// web search results and returns a slice of URLCitationAnnotation objects.
+//
+// The model is prompted with numbered results ("1. Title\n   URL: ...") so it
+// commonly cites them as [1], [2], [Source 1], etc. This function finds every
+// such marker in the text, maps it to the corresponding result URL/title, and
+// records the byte-rune span so clients can highlight the citation.
+//
+// results is the same []map[string]any slice passed to the model as a tool
+// message (keys: "title", "url", "content").
+func ExtractWebSearchCitations(text string, results []map[string]any) []URLCitationAnnotation {
+	if len(results) == 0 || text == "" {
+		return nil
+	}
+	runes := []rune(text)
+	var annotations []URLCitationAnnotation
+	// Match citation markers: [1], [2], [Source 1], [source 2], etc.
+	// We scan rune-by-rune for '[' followed by an optional word and a digit.
+	i := 0
+	for i < len(runes) {
+		if runes[i] != '[' {
+			i++
+			continue
+		}
+		// Try to parse a citation marker starting at i.
+		j := i + 1
+		// Skip optional prefix like "Source ", "source ", "Ref ", etc.
+		for j < len(runes) && runes[j] != ']' && runes[j] != '\n' && !isDigitRune(runes[j]) {
+			j++
+		}
+		// Collect digits.
+		digStart := j
+		for j < len(runes) && isDigitRune(runes[j]) {
+			j++
+		}
+		if j == digStart {
+			// No digits found — not a citation.
+			i++
+			continue
+		}
+		if j >= len(runes) || runes[j] != ']' {
+			i++
+			continue
+		}
+		// Parse the number.
+		num := 0
+		for _, r := range runes[digStart:j] {
+			num = num*10 + int(r-'0')
+		}
+		// Map to a result (1-indexed).
+		if num >= 1 && num <= len(results) {
+			result := results[num-1]
+			url, _ := result["url"].(string)
+			title, _ := result["title"].(string)
+			if url != "" {
+				annotations = append(annotations, URLCitationAnnotation{
+					Type:       "url_citation",
+					URL:        url,
+					Title:      title,
+					StartIndex: i,
+					EndIndex:   j + 1, // exclusive, points past ']'
+				})
+			}
+		}
+		i = j + 1
+	}
+	return annotations
+}
+
+func isDigitRune(r rune) bool { return r >= '0' && r <= '9' }
+
 type ResponsesInputTokensDetails struct {
 	CachedTokens int `json:"cached_tokens"`
 }
@@ -1035,6 +1117,10 @@ type ResponsesStreamConverter struct {
 
 	// Tool calls state (for final output)
 	toolCallItems []map[string]any
+
+	// Web search results for url_citation annotation injection.
+	// Set by WebSearchCallEvents when a web_search_call is processed.
+	webSearchResults []map[string]any
 }
 
 // newEvent creates a ResponsesStreamEvent with the sequence number included in the data.
@@ -1404,12 +1490,15 @@ func (c *ResponsesStreamConverter) WebSearchCallEvents(wsItemID, query string, r
 		"item":         wsItem,
 	}))
 
-	// Store for buildFinalOutput / response.completed
+		// Store for buildFinalOutput / response.completed
 	c.toolCallItems = append(c.toolCallItems, wsItem)
 	c.outputIndex++
+	// Store results so processCompletion can inject url_citation annotations.
+	if len(results) > 0 {
+		c.webSearchResults = results
+	}
 	return events
 }
-
 // FileSearchCallEvents emits the Responses API streaming events for a
 // file_search_call item: output_item.added (in_progress), output_item.done
 // (completed with results). The caller (ResponsesFileSearchWriter) must call
@@ -1517,6 +1606,20 @@ func (c *ResponsesStreamConverter) buildFinalOutput() []any {
 			output = append(output, item)
 		}
 	} else if c.contentStarted {
+		// Build url_citation annotations if web search results are available.
+		var finalAnnotations []any
+		if len(c.webSearchResults) > 0 {
+			citations := ExtractWebSearchCitations(c.accumulatedText, c.webSearchResults)
+			if len(citations) > 0 {
+				finalAnnotations = make([]any, len(citations))
+				for i, cit := range citations {
+					finalAnnotations[i] = cit
+				}
+			}
+		}
+		if finalAnnotations == nil {
+			finalAnnotations = []any{}
+		}
 		// Add message item if we had text content
 		output = append(output, map[string]any{
 			"id":     c.itemID,
@@ -1527,7 +1630,7 @@ func (c *ResponsesStreamConverter) buildFinalOutput() []any {
 			"content": []map[string]any{{
 				"type":        "output_text",
 				"text":        c.accumulatedText,
-				"annotations": []any{},
+				"annotations": finalAnnotations,
 				"logprobs":    []any{},
 			}},
 		})
@@ -1544,6 +1647,21 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 
 	// Emit text completion events if we had text content
 	if !c.toolCallsSent && c.contentStarted {
+		// Build url_citation annotations if web search results are available.
+		var annotations []any
+		if len(c.webSearchResults) > 0 {
+			citations := ExtractWebSearchCitations(c.accumulatedText, c.webSearchResults)
+			if len(citations) > 0 {
+				annotations = make([]any, len(citations))
+				for i, cit := range citations {
+					annotations[i] = cit
+				}
+			}
+		}
+		if annotations == nil {
+			annotations = []any{}
+		}
+
 		// response.output_text.done
 		events = append(events, c.newEvent("response.output_text.done", map[string]any{
 			"item_id":       c.itemID,
@@ -1561,7 +1679,7 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 			"part": map[string]any{
 				"type":        "output_text",
 				"text":        c.accumulatedText,
-				"annotations": []any{},
+				"annotations": annotations,
 				"logprobs":    []any{},
 			},
 		}))
@@ -1578,7 +1696,7 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 				"content": []map[string]any{{
 					"type":        "output_text",
 					"text":        c.accumulatedText,
-					"annotations": []any{},
+					"annotations": annotations,
 					"logprobs":    []any{},
 				}},
 			},

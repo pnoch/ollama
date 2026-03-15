@@ -250,3 +250,180 @@ func TestToolChoiceDescription(t *testing.T) {
 		}
 	}
 }
+
+
+// ─── Edge cases ───────────────────────────────────────────────────────────────
+
+// TestToolChoiceGrammarSchema_Required_ZeroTools verifies that required with no
+// tools returns nil (nothing to constrain against).
+func TestToolChoiceGrammarSchema_Required_ZeroTools(t *testing.T) {
+	got := ToolChoiceGrammarSchema(ParsedToolChoice{Kind: ToolChoiceRequired}, nil)
+	if got != nil {
+		t.Errorf("expected nil for required with no tools, got %s", string(got))
+	}
+}
+
+// TestToolChoiceGrammarSchema_Required_EmptyToolList verifies that an empty
+// (non-nil) tool slice behaves the same as nil — returns nil schema.
+func TestToolChoiceGrammarSchema_Required_EmptyToolList(t *testing.T) {
+	got := ToolChoiceGrammarSchema(ParsedToolChoice{Kind: ToolChoiceRequired}, []api.Tool{})
+	if got != nil {
+		t.Errorf("expected nil for required with empty tool list, got %s", string(got))
+	}
+}
+
+// TestToolChoiceGrammarSchema_Named_NoParamsTool verifies that a named tool
+// with no parameters still produces a valid schema (arguments is an empty
+// object schema, not null).
+func TestToolChoiceGrammarSchema_Named_NoParamsTool(t *testing.T) {
+	noParamsTool := api.Tool{
+		Type: "function",
+		Function: api.ToolFunction{
+			Name:        "ping",
+			Description: "Ping with no arguments",
+			Parameters:  api.ToolFunctionParameters{},
+		},
+	}
+	got := ToolChoiceGrammarSchema(ParsedToolChoice{Kind: ToolChoiceNamed, FuncName: "ping"}, []api.Tool{noParamsTool})
+	if got == nil {
+		t.Fatal("expected non-nil schema for named tool with no parameters")
+	}
+	var v map[string]any
+	if err := json.Unmarshal(got, &v); err != nil {
+		t.Fatalf("schema is not valid JSON: %v", err)
+	}
+	// Must contain the tool name as a const.
+	if !strings.Contains(string(got), "ping") {
+		t.Errorf("schema does not contain tool name 'ping': %s", string(got))
+	}
+	// arguments property must be present and be an object schema.
+	props, _ := v["properties"].(map[string]any)
+	if props == nil {
+		t.Fatalf("schema missing properties: %s", string(got))
+	}
+	args, _ := props["arguments"].(map[string]any)
+	if args == nil {
+		t.Fatalf("schema missing arguments property: %s", string(got))
+	}
+	if args["type"] != "object" {
+		t.Errorf("arguments type = %v, want object", args["type"])
+	}
+}
+
+// TestToolCallSchema_AdditionalPropertiesFalse verifies that the generated
+// schema always sets additionalProperties=false at the top level, which is
+// required for grammar-constrained generation to reject unexpected fields.
+func TestToolCallSchema_AdditionalPropertiesFalse(t *testing.T) {
+	tool := sampleTool("strict_tool")
+	got := ToolChoiceGrammarSchema(ParsedToolChoice{Kind: ToolChoiceNamed, FuncName: "strict_tool"}, []api.Tool{tool})
+	if got == nil {
+		t.Fatal("expected non-nil schema")
+	}
+	var v map[string]any
+	if err := json.Unmarshal(got, &v); err != nil {
+		t.Fatalf("schema is not valid JSON: %v", err)
+	}
+	if v["additionalProperties"] != false {
+		t.Errorf("expected additionalProperties=false at top level, got %v", v["additionalProperties"])
+	}
+}
+
+// TestToolChoiceFilterTools_Named_NonExistent verifies that filtering for a
+// named tool that does not exist in the list returns nil (not an empty slice).
+func TestToolChoiceFilterTools_Named_NonExistent(t *testing.T) {
+	all := []api.Tool{sampleTool("a"), sampleTool("b")}
+	got := ToolChoiceFilterTools(ParsedToolChoice{Kind: ToolChoiceNamed, FuncName: "nonexistent"}, all)
+	if got != nil {
+		t.Errorf("expected nil for non-existent named tool, got %v", got)
+	}
+}
+
+// TestToolChoiceFilterTools_Required_ReturnsAll verifies that required returns
+// all tools unchanged (same as auto).
+func TestToolChoiceFilterTools_Required_ReturnsAll(t *testing.T) {
+	all := []api.Tool{sampleTool("a"), sampleTool("b"), sampleTool("c")}
+	got := ToolChoiceFilterTools(ParsedToolChoice{Kind: ToolChoiceRequired}, all)
+	if len(got) != 3 {
+		t.Errorf("expected 3 tools for required, got %d", len(got))
+	}
+}
+
+// TestInjectToolChoiceSystemMessage_MultipleSystemMessages verifies that when
+// there are multiple system messages, the suffix is appended to the LAST one
+// (not the first), so it is closest to the user turn.
+func TestInjectToolChoiceSystemMessage_MultipleSystemMessages(t *testing.T) {
+	msgs := []api.Message{
+		{Role: "system", Content: "First system message."},
+		{Role: "system", Content: "Second system message."},
+		{Role: "user", Content: "do something"},
+	}
+	got := InjectToolChoiceSystemMessage(msgs, ParsedToolChoice{Kind: ToolChoiceRequired})
+	if len(got) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(got))
+	}
+	// First system message should be unchanged.
+	if got[0].Content != "First system message." {
+		t.Errorf("first system message was modified: %q", got[0].Content)
+	}
+	// Second (last) system message should have the suffix appended.
+	if !strings.Contains(got[1].Content, "Second system message.") {
+		t.Errorf("second system message lost original content: %q", got[1].Content)
+	}
+	if !strings.Contains(got[1].Content, "You must respond by calling") {
+		t.Errorf("suffix not appended to last system message: %q", got[1].Content)
+	}
+}
+
+// TestInjectToolChoiceSystemMessage_DeveloperRole verifies that a "developer"
+// role message is treated the same as "system" for suffix injection.
+func TestInjectToolChoiceSystemMessage_DeveloperRole(t *testing.T) {
+	msgs := []api.Message{
+		{Role: "developer", Content: "Developer instructions."},
+		{Role: "user", Content: "do something"},
+	}
+	got := InjectToolChoiceSystemMessage(msgs, ParsedToolChoice{Kind: ToolChoiceNamed, FuncName: "my_tool"})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(got))
+	}
+	if got[0].Role != "developer" {
+		t.Errorf("expected developer role preserved, got %q", got[0].Role)
+	}
+	if !strings.Contains(got[0].Content, "my_tool") {
+		t.Errorf("suffix not injected into developer message: %q", got[0].Content)
+	}
+}
+
+// TestToolChoiceGrammarSchema_Named_ValidJSON verifies that the schema for a
+// named tool with multiple parameters is well-formed JSON and includes all
+// parameter names.
+func TestToolChoiceGrammarSchema_Named_ValidJSON(t *testing.T) {
+	props := api.NewToolPropertiesMap()
+	props.Set("query", api.ToolProperty{Type: []string{"string"}, Description: "Search query"})
+	props.Set("limit", api.ToolProperty{Type: []string{"integer"}, Description: "Max results"})
+	tool := api.Tool{
+		Type: "function",
+		Function: api.ToolFunction{
+			Name:        "search",
+			Description: "Search the web",
+			Parameters: api.ToolFunctionParameters{
+				Type:       "object",
+				Properties: props,
+				Required:   []string{"query"},
+			},
+		},
+	}
+
+	got := ToolChoiceGrammarSchema(ParsedToolChoice{Kind: ToolChoiceNamed, FuncName: "search"}, []api.Tool{tool})
+	if got == nil {
+		t.Fatal("expected non-nil schema")
+	}
+	if err := json.Unmarshal(got, new(any)); err != nil {
+		t.Fatalf("schema is not valid JSON: %v\n%s", err, string(got))
+	}
+	if !strings.Contains(string(got), "query") {
+		t.Errorf("schema missing 'query' parameter: %s", string(got))
+	}
+	if !strings.Contains(string(got), "limit") {
+		t.Errorf("schema missing 'limit' parameter: %s", string(got))
+	}
+}
