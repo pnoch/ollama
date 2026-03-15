@@ -562,3 +562,52 @@ func TestOpenAIPassthroughMiddleware_OAuthTokenRoutesToChatGPT(t *testing.T) {
 	}
 	_ = receivedHost // verified by the 200 response from the mock
 }
+
+// TestOpenAIPassthroughMiddleware_OAuthJWTPriorityOverAPIKey verifies that when
+// the incoming request carries a ChatGPT OAuth JWT AND OPENAI_API_KEY is also
+// set to a real API key, the JWT wins and the request is routed to the
+// ChatGPT codex base URL (not api.openai.com).
+func TestOpenAIPassthroughMiddleware_OAuthJWTPriorityOverAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Fake ChatGPT OAuth JWT (three base64url segments, starts with eyJ).
+	fakeJWT := "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIn0.fakesig"
+
+	var receivedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"resp-1"}`))
+	}))
+	defer upstream.Close()
+
+	// Set OPENAI_API_KEY to a real-looking key — it should be ignored in favour
+	// of the incoming OAuth JWT.
+	t.Setenv("OPENAI_API_KEY", "sk-realkey123")
+	// Point the ChatGPT codex base URL to our mock upstream.
+	t.Setenv("OLLAMA_CHATGPT_CODEX_BASE_URL", upstream.URL)
+
+	router := gin.New()
+	router.POST("/v1/responses", openAIPassthroughMiddleware(), func(c *gin.Context) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "model not found locally"})
+	})
+
+	body := `{"model":"gpt-5.4","input":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+fakeJWT)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("proxy did not activate: request fell through to local handler (got 404)")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from upstream, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// The request must have been sent with the JWT, not the API key.
+	wantAuth := "Bearer " + fakeJWT
+	if receivedAuth != wantAuth {
+		t.Fatalf("expected Authorization %q, got %q", wantAuth, receivedAuth)
+	}
+}

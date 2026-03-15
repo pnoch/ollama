@@ -149,21 +149,30 @@ func openAIPassthroughMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Determine the credential to use for proxying.  Priority:
-		//  1. OPENAI_API_KEY env var or stored key in ~/.codex/auth.json
-		//  2. The Authorization header that Codex already sent in the request
-		//     (e.g. a ChatGPT OAuth access_token for cloud model sessions).
+		// Determine the credential to use for proxying.
 		//
-		// This handles the case where the user is logged in via ChatGPT OAuth
-		// and switches to a cloud model (gpt-5.4, o3, etc.) inside Codex:
-		// Codex sends its OAuth token in Authorization, but OPENAI_API_KEY is
-		// not set (only the dummy 'ollama' placeholder is in the env).
-		apiKey := openAIAPIKey()
-		if apiKey == "" || apiKey == "ollama" {
-			// Fall back to the credential Codex already sent in the request.
+		// Priority:
+		//  1. If the incoming request carries a ChatGPT OAuth JWT (eyJ…), use
+		//     that — it must be routed to chatgpt.com, not api.openai.com.
+		//     This handles the case where the user switches to a ChatGPT-only
+		//     model (gpt-5.4, o3, etc.) inside Codex while logged in via OAuth.
+		//  2. OPENAI_API_KEY env var or stored key in ~/.codex/auth.json.
+		//  3. Any other real credential in the incoming Authorization header.
+		var apiKey string
+		if incomingAuth := c.GetHeader("Authorization"); isRealCredential(incomingAuth) {
+			incomingToken := strings.TrimSpace(strings.TrimPrefix(incomingAuth, "Bearer "))
+			if isChatGPTOAuthToken(incomingToken) {
+				// Always prefer the OAuth JWT so it routes to chatgpt.com.
+				apiKey = incomingToken
+			}
+		}
+		if apiKey == "" {
+			apiKey = openAIAPIKey()
+		}
+		if (apiKey == "" || apiKey == "ollama") {
+			// Last resort: use whatever real credential Codex sent.
 			if incomingAuth := c.GetHeader("Authorization"); isRealCredential(incomingAuth) {
-				apiKey = strings.TrimPrefix(incomingAuth, "Bearer ")
-				apiKey = strings.TrimSpace(apiKey)
+				apiKey = strings.TrimSpace(strings.TrimPrefix(incomingAuth, "Bearer "))
 			}
 		}
 		if apiKey == "" {
@@ -376,6 +385,10 @@ func isChatGPTOAuthToken(key string) bool {
 	return strings.HasPrefix(key, "eyJ") || strings.Count(key, ".") >= 2
 }
 
+// chatGPTCodexBaseURLEnv is an optional env var that overrides the ChatGPT
+// codex base URL.  It is intended for testing only.
+const chatGPTCodexBaseURLEnv = "OLLAMA_CHATGPT_CODEX_BASE_URL"
+
 // upstreamBaseURLForCredential returns the correct upstream base URL for the
 // given credential.  ChatGPT OAuth JWTs use chatgpt.com/backend-api/codex;
 // OpenAI API keys use the configured OLLAMA_OPENAI_PROXY_BASE_URL (default:
@@ -386,6 +399,10 @@ func upstreamBaseURLForCredential(apiKey string) string {
 		return strings.TrimRight(v, "/")
 	}
 	if isChatGPTOAuthToken(apiKey) {
+		// Allow test override of the ChatGPT codex base URL.
+		if v := strings.TrimSpace(os.Getenv(chatGPTCodexBaseURLEnv)); v != "" {
+			return strings.TrimRight(v, "/")
+		}
 		return chatGPTCodexBaseURL
 	}
 	return defaultOpenAIProxyBaseURL
