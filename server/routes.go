@@ -102,9 +102,6 @@ type Server struct {
 	addr          net.Addr
 	sched         *Scheduler
 	defaultNumCtx int
-	aliasesOnce sync.Once
-	aliases     *store
-	aliasesErr  error
 	vectorStore *vectorstore.Store
 }
 
@@ -1700,12 +1697,12 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	// Inference (OpenAI compatibility)
 	// TODO(cloud-stage-a): apply Modelfile overlay deltas for local models with cloud
 	// parents on v1 request families while preserving this explicit :cloud passthrough.
-	r.POST("/v1/chat/completions", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ChatMiddleware(), s.ChatHandler)
-	r.POST("/v1/completions", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.CompletionsMiddleware(), s.GenerateHandler)
-	r.POST("/v1/embeddings", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.EmbeddingsMiddleware(), s.EmbedHandler)
-	r.GET("/v1/models", middleware.ListMiddleware(), s.ListHandler)
+	r.POST("/v1/chat/completions", openAIPassthroughMiddleware(), cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ChatMiddleware(), s.ChatHandler)
+	r.POST("/v1/completions", openAIPassthroughMiddleware(), cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.CompletionsMiddleware(), s.GenerateHandler)
+	r.POST("/v1/embeddings", openAIPassthroughMiddleware(), cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.EmbeddingsMiddleware(), s.EmbedHandler)
+	r.GET("/v1/models", openAIModelsPassthroughMiddleware(), middleware.ListMiddleware(), s.ListHandler)
 	r.GET("/v1/models/:model", cloudModelPathPassthroughMiddleware(cloudErrRemoteModelDetailsUnavailable), middleware.RetrieveMiddleware(), s.ShowHandler)
-	r.POST("/v1/responses", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.FileSearchDepsMiddleware(""), middleware.ResponsesMiddleware(), s.ChatHandler)
+	r.POST("/v1/responses", openAIPassthroughMiddleware(), cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.FileSearchDepsMiddleware(""), middleware.ResponsesMiddleware(), s.ChatHandler)
 	r.POST("/v1/responses/compact", s.ResponsesCompactHandler)
 	// OpenAI-compatible image generation endpoints
 	r.POST("/v1/images/generations", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ImageGenerationsMiddleware(), s.GenerateHandler)

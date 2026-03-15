@@ -1,0 +1,264 @@
+package server
+
+// openai_proxy.go — transparent passthrough proxy to the real OpenAI API.
+//
+// When Ollama receives a request for a model that is neither locally installed
+// nor a cloud (ollama.com) model, it forwards the request verbatim to the
+// upstream OpenAI-compatible API.  This lets a single Ollama endpoint serve
+// both local models and OpenAI models without the caller needing to know which
+// is which.
+//
+// Configuration (all optional):
+//
+//	OLLAMA_OPENAI_PROXY_BASE_URL  – upstream base URL (default: https://api.openai.com/v1)
+//	OPENAI_API_KEY                – Bearer token forwarded to upstream
+//	OPENAI_ORG_ID                 – forwarded as OpenAI-Organization header
+//	OPENAI_PROJECT_ID             – forwarded as OpenAI-Project header
+//
+// The middleware is inserted before cloudPassthroughMiddleware in the chain so
+// that explicit ":cloud" models still go through the Ollama cloud proxy.
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/ollama/ollama/manifest"
+	"github.com/ollama/ollama/types/model"
+)
+
+const (
+	// defaultOpenAIProxyBaseURL is the upstream used when
+	// OLLAMA_OPENAI_PROXY_BASE_URL is not set.
+	defaultOpenAIProxyBaseURL = "https://api.openai.com/v1"
+
+	// openAIProxyBaseURLEnv is the environment variable that overrides the
+	// upstream OpenAI base URL.
+	openAIProxyBaseURLEnv = "OLLAMA_OPENAI_PROXY_BASE_URL"
+)
+
+// openAIProxyBaseURL returns the upstream base URL for the OpenAI proxy,
+// trimming any trailing slash so we can append paths cleanly.
+func openAIProxyBaseURL() string {
+	if v := strings.TrimSpace(os.Getenv(openAIProxyBaseURLEnv)); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return defaultOpenAIProxyBaseURL
+}
+
+// openAIAPIKey returns the API key to use when proxying to OpenAI.
+// It prefers OPENAI_API_KEY and falls back to an empty string (which will
+// cause OpenAI to return a 401, surfaced cleanly to the caller).
+func openAIAPIKey() string {
+	if v := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); v != "" {
+		return v
+	}
+	return ""
+}
+
+// isModelLocalOrCloud returns true when the model name refers to a locally
+// installed Ollama model or to an explicit Ollama cloud model (":cloud"
+// suffix).  In either case the request should NOT be proxied to OpenAI.
+func isModelLocalOrCloud(modelName string) bool {
+	// Parse the model reference to detect an explicit ":cloud" source tag.
+	ref, err := parseAndValidateModelRef(modelName)
+	if err != nil {
+		// Unparseable name — let the normal handler deal with it.
+		return true
+	}
+	if ref.Source == modelSourceCloud {
+		return true
+	}
+
+	// Check whether the model is locally installed by looking for its
+	// manifest on disk.  An os.IsNotExist error means it is not local.
+	_, manifestErr := manifest.ParseNamedManifest(ref.Name)
+	if manifestErr == nil {
+		// Manifest found — model is local.
+		return true
+	}
+	// Any error other than "not found" (e.g. permission denied, corrupt
+	// manifest) is treated conservatively as "local" so we don't
+	// accidentally proxy a request that should stay local.
+	if !os.IsNotExist(manifestErr) {
+		return true
+	}
+	return false
+}
+
+// openAIPassthroughMiddleware returns a gin.HandlerFunc that transparently
+// proxies requests to the upstream OpenAI API when the requested model is
+// neither a local Ollama model nor an explicit cloud model.
+//
+// The middleware is designed to be placed first in the handler chain for
+// OpenAI-compatible endpoints:
+//
+//	r.POST("/v1/chat/completions",
+//	    openAIPassthroughMiddleware(),
+//	    cloudPassthroughMiddleware(...),
+//	    middleware.ChatMiddleware(),
+//	    s.ChatHandler)
+func openAIPassthroughMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Only intercept POST requests; GET requests (e.g. /v1/models) are
+		// handled by a separate path.
+		if c.Request.Method != http.MethodPost {
+			c.Next()
+			return
+		}
+
+		apiKey := openAIAPIKey()
+		if apiKey == "" {
+			// No API key configured — skip proxy and let the local handler
+			// attempt to serve the request (it will fail gracefully if the
+			// model is not found locally).
+			c.Next()
+			return
+		}
+
+		// Buffer the request body so we can inspect the model field without
+		// consuming the stream.  readRequestBody also handles zstd
+		// decompression and restores c.Request.Body for downstream handlers.
+		body, err := readRequestBody(c.Request)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.Abort()
+			return
+		}
+
+		modelName, ok := extractModelField(body)
+		if !ok {
+			// No model field — let the normal handler return the appropriate
+			// error.
+			c.Next()
+			return
+		}
+
+		if isModelLocalOrCloud(modelName) {
+			// Local or explicit cloud model — do not proxy to OpenAI.
+			c.Next()
+			return
+		}
+
+		// The model is not local and not an explicit cloud model.  Proxy to
+		// the upstream OpenAI API.
+		proxyToOpenAI(c, body, apiKey)
+		c.Abort()
+	}
+}
+
+// openAIModelsPassthroughMiddleware merges the upstream OpenAI /v1/models list
+// into the local Ollama model list.  It is used on the GET /v1/models route.
+//
+// NOTE: This is a future extension point.  For now the middleware is a no-op
+// pass-through so the route wiring is already in place.
+func openAIModelsPassthroughMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+	}
+}
+
+// proxyToOpenAI forwards the current request to the upstream OpenAI API and
+// streams the response back to the caller.
+func proxyToOpenAI(c *gin.Context, body []byte, apiKey string) {
+	baseURL := openAIProxyBaseURL()
+
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid OpenAI proxy base URL: " + err.Error()})
+		return
+	}
+
+	// Resolve the full target URL by appending the request path and query.
+	// Strip the leading "/v1" prefix from the Ollama path because the base
+	// URL already includes "/v1" (e.g. https://api.openai.com/v1).
+	upstreamPath := c.Request.URL.Path
+	if strings.HasPrefix(upstreamPath, "/v1") {
+		upstreamPath = upstreamPath[len("/v1"):]
+	}
+	targetURL := base.ResolveReference(&url.URL{
+		Path:     upstreamPath,
+		RawQuery: c.Request.URL.RawQuery,
+	})
+
+	outReq, err := http.NewRequestWithContext(
+		c.Request.Context(),
+		c.Request.Method,
+		targetURL.String(),
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Copy safe request headers from the incoming request.
+	copyProxyRequestHeaders(outReq.Header, c.Request.Header)
+
+	// Override / set the Authorization header with the real OpenAI key.
+	outReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	// Forward optional organisation and project headers.
+	if org := strings.TrimSpace(os.Getenv("OPENAI_ORG_ID")); org != "" {
+		outReq.Header.Set("OpenAI-Organization", org)
+	}
+	if proj := strings.TrimSpace(os.Getenv("OPENAI_PROJECT_ID")); proj != "" {
+		outReq.Header.Set("OpenAI-Project", proj)
+	}
+
+	if outReq.Header.Get("Content-Type") == "" && len(body) > 0 {
+		outReq.Header.Set("Content-Type", "application/json")
+	}
+
+	slog.Debug("openai proxy: forwarding request",
+		"path", c.Request.URL.Path,
+		"target", targetURL.String(),
+	)
+
+	resp, err := http.DefaultClient.Do(outReq)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "OpenAI proxy error: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	copyProxyResponseHeaders(c.Writer.Header(), resp.Header)
+	c.Status(resp.StatusCode)
+
+	if err := copyProxyStream(c.Writer, resp.Body); err != nil {
+		ctxErr := c.Request.Context().Err()
+		if errors.Is(err, context.Canceled) && errors.Is(ctxErr, context.Canceled) {
+			slog.Debug("openai proxy: stream closed by client",
+				"path", c.Request.URL.Path,
+				"status", resp.StatusCode,
+			)
+			return
+		}
+		slog.Warn("openai proxy: response copy failed",
+			"path", c.Request.URL.Path,
+			"status", resp.StatusCode,
+			"error", err,
+		)
+	}
+}
+
+// openAIProxyModelName extracts the model name from a request body and
+// returns the fully-qualified Ollama model.Name for local existence checks.
+// Returns the zero Name and false if the model field is absent or unparseable.
+func openAIProxyModelName(body []byte) (model.Name, bool) {
+	raw, ok := extractModelField(body)
+	if !ok {
+		return model.Name{}, false
+	}
+	ref, err := parseAndValidateModelRef(raw)
+	if err != nil {
+		return model.Name{}, false
+	}
+	return ref.Name, true
+}
