@@ -2222,11 +2222,13 @@ func TestResponsesStreamConverter_FileSearchCallEvents(t *testing.T) {
 		{"file_id": "file_1", "filename": "doc.txt", "text": "relevant text", "score": 0.95},
 	}
 	events := c.FileSearchCallEvents("fs_1_5", "find docs", chunks)
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events, got %d", len(events))
+	// Now 4 events: output_item.added, file_search_call.searching,
+	// file_search_call.results, output_item.done
+	if len(events) != 4 {
+		t.Fatalf("expected 4 events, got %d", len(events))
 	}
 
-	// First event: output_item.added with status in_progress.
+	// Event 0: output_item.added with status in_progress.
 	addedEvent := events[0]
 	if addedEvent.Event != "response.output_item.added" {
 		t.Errorf("event[0].Event = %q, want %q", addedEvent.Event, "response.output_item.added")
@@ -2249,18 +2251,28 @@ func TestResponsesStreamConverter_FileSearchCallEvents(t *testing.T) {
 		t.Errorf("item query = %q, want %q", addedItem["query"], "find docs")
 	}
 
-	// Second event: output_item.done with status completed and results.
-	doneEvent := events[1]
+	// Event 1: file_search_call.searching delta.
+	if events[1].Event != "response.file_search_call.searching" {
+		t.Errorf("event[1].Event = %q, want %q", events[1].Event, "response.file_search_call.searching")
+	}
+
+	// Event 2: file_search_call.results delta.
+	if events[2].Event != "response.file_search_call.results" {
+		t.Errorf("event[2].Event = %q, want %q", events[2].Event, "response.file_search_call.results")
+	}
+
+	// Event 3: output_item.done with status completed and results.
+	doneEvent := events[3]
 	if doneEvent.Event != "response.output_item.done" {
-		t.Errorf("event[1].Event = %q, want %q", doneEvent.Event, "response.output_item.done")
+		t.Errorf("event[3].Event = %q, want %q", doneEvent.Event, "response.output_item.done")
 	}
 	doneData, _ := doneEvent.Data.(map[string]any)
 	if doneData == nil {
-		t.Fatal("event[1] Data is not map[string]any")
+		t.Fatal("event[3] Data is not map[string]any")
 	}
 	doneItem, _ := doneData["item"].(map[string]any)
 	if doneItem == nil {
-		t.Fatal("event[1] missing item")
+		t.Fatal("event[3] missing item")
 	}
 	if doneItem["status"] != "completed" {
 		t.Errorf("done item status = %q, want %q", doneItem["status"], "completed")
@@ -2487,4 +2499,53 @@ t.Fatal("expected both annotation.added and output_text.done events")
 if annIdx >= doneIdx {
 t.Errorf("annotation.added (index %d) must come before output_text.done (index %d)", annIdx, doneIdx)
 }
+}
+
+func TestFileSearchCallEvents_EmitsSearchingAndResults(t *testing.T) {
+	conv := NewResponsesStreamConverter("resp_test", "item_test", "gpt-test", ResponsesRequest{})
+	chunks := []any{
+		map[string]any{"text": "chunk 1", "score": 0.9},
+		map[string]any{"text": "chunk 2", "score": 0.7},
+	}
+	events := conv.FileSearchCallEvents("fs_001", "what is Go?", chunks)
+
+	// Expect 4 events: output_item.added, file_search_call.searching,
+	// file_search_call.results, output_item.done
+	if len(events) != 4 {
+		t.Fatalf("expected 4 events, got %d", len(events))
+	}
+
+	wantTypes := []string{
+		"response.output_item.added",
+		"response.file_search_call.searching",
+		"response.file_search_call.results",
+		"response.output_item.done",
+	}
+	for i, ev := range events {
+		if ev.Event != wantTypes[i] {
+			t.Errorf("event[%d]: want %q, got %q", i, wantTypes[i], ev.Event)
+		}
+	}
+
+	// Verify searching event has item_id
+	searchingData, _ := events[1].Data.(map[string]any)
+	if searchingData["item_id"] != "fs_001" {
+		t.Errorf("searching event item_id: want %q, got %v", "fs_001", searchingData["item_id"])
+	}
+
+	// Verify results event has results payload
+	resultsData, _ := events[2].Data.(map[string]any)
+	if resultsData["item_id"] != "fs_001" {
+		t.Errorf("results event item_id: want %q, got %v", "fs_001", resultsData["item_id"])
+	}
+	if resultsData["results"] == nil {
+		t.Error("results event missing results field")
+	}
+
+	// Verify output_item.done has status completed
+	doneData, _ := events[3].Data.(map[string]any)
+	item, _ := doneData["item"].(map[string]any)
+	if item["status"] != "completed" {
+		t.Errorf("output_item.done status: want %q, got %v", "completed", item["status"])
+	}
 }

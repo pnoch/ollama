@@ -19,6 +19,7 @@ package server
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"fmt"
 	"io"
 	"mime"
@@ -26,17 +27,146 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
-
+	"sync"
+	"time"
 	"github.com/gin-gonic/gin"
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/server/vectorstore"
 )
 
-// ─── Create vector store ─────────────────────────────────────────────────────
+// ─── /v1/files upload store ─────────────────────────────────────────────────
+// filesStore is an in-process store for files uploaded via POST /v1/files.
+// Files are kept in memory so that file_ids can be resolved by the batch
+// endpoint without requiring a separate file-storage service.
+//
+// The store is keyed by the file ID returned to the caller.
+type uploadedFile struct {
+	ID        string
+	Filename  string
+	MimeType  string
+	Content   []byte
+	CreatedAt int64
+}
 
+type filesStore struct {
+	mu    sync.RWMutex
+	files map[string]*uploadedFile
+}
+
+var globalFilesStore = &filesStore{files: make(map[string]*uploadedFile)}
+
+func (fs *filesStore) add(filename, mimeType string, content []byte) *uploadedFile {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	id := "file-" + newFileID(24)
+	f := &uploadedFile{
+		ID:        id,
+		Filename:  filename,
+		MimeType:  mimeType,
+		Content:   content,
+		CreatedAt: time.Now().Unix(),
+	}
+	fs.files[id] = f
+	return f
+}
+
+func (fs *filesStore) get(id string) (*uploadedFile, bool) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	f, ok := fs.files[id]
+	return f, ok
+}
+
+func newFileID(n int) string {
+	b := make([]byte, n/2+1)
+	_, _ = crand.Read(b)
+	return fmt.Sprintf("%x", b)[:n]
+}
+
+// UploadFileHandler handles POST /v1/files.
+// Accepts multipart/form-data with a "file" part (and optional "purpose" field)
+// or a raw body upload. Returns a File object compatible with the OpenAI Files API.
+func (s *Server) UploadFileHandler(c *gin.Context) {
+	contentType := c.GetHeader("Content-Type")
+	mediaType, params, _ := mime.ParseMediaType(contentType)
+
+	var filename, mimeType string
+	var content []byte
+
+	switch {
+	case strings.HasPrefix(mediaType, "multipart/"):
+		mr := multipart.NewReader(c.Request.Body, params["boundary"])
+		for {
+			part, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "malformed multipart: " + err.Error()})
+				return
+			}
+			if part.FormName() == "file" {
+				filename = part.FileName()
+				mimeType = part.Header.Get("Content-Type")
+				if mimeType == "" {
+					mimeType = "application/octet-stream"
+				}
+				var buf bytes.Buffer
+				if _, err := io.Copy(&buf, io.LimitReader(part, 512<<20)); err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "read file: " + err.Error()})
+					return
+				}
+				content = buf.Bytes()
+			}
+		}
+	default:
+		filename = c.GetHeader("X-Filename")
+		if filename == "" {
+			if _, p, err := mime.ParseMediaType(c.GetHeader("Content-Disposition")); err == nil {
+				filename = p["filename"]
+			}
+		}
+		if filename == "" {
+			filename = "upload"
+		}
+		mimeType = mediaType
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, io.LimitReader(c.Request.Body, 512<<20)); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "read body: " + err.Error()})
+			return
+		}
+		content = buf.Bytes()
+	}
+
+	if len(content) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file content is empty"})
+		return
+	}
+	if mimeType == "application/octet-stream" && filename != "" {
+		if t := mime.TypeByExtension(filepath.Ext(filename)); t != "" {
+			mimeType = t
+		}
+	}
+
+	f := globalFilesStore.add(filename, mimeType, content)
+	c.JSON(http.StatusOK, gin.H{
+		"id":         f.ID,
+		"object":     "file",
+		"filename":   f.Filename,
+		"bytes":      len(f.Content),
+		"created_at": f.CreatedAt,
+		"purpose":    "assistants",
+	})
+}
+
+// ─── Create vector store ─────────────────────────────────────────────────────
 type createVectorStoreRequest struct {
-	Name     string         `json:"name"`
-	Metadata map[string]any `json:"metadata"`
+	Name         string                      `json:"name"`
+	Metadata     map[string]any              `json:"metadata"`
+	ExpiresAfter *vectorstore.ExpiresAfter   `json:"expires_after"`
 }
 
 func (s *Server) CreateVectorStoreHandler(c *gin.Context) {
@@ -45,7 +175,7 @@ func (s *Server) CreateVectorStoreHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	vs, err := s.vectorStore.CreateVectorStore(req.Name, req.Metadata)
+	vs, err := s.vectorStore.CreateVectorStore(req.Name, req.Metadata, req.ExpiresAfter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -441,16 +571,24 @@ func (s *Server) UploadVectorStoreFileBatchHandler(c *gin.Context) {
 			}
 		}
 	default:
-		// JSON body with file_ids (future use) or empty.
+		// JSON body with file_ids (OpenAI SDK path) or empty.
 		var req fileBatchRequest
 		if err := c.ShouldBindJSON(&req); err != nil && err != io.EOF {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 		embedModel = req.EmbedModel
-		if len(req.FileIDs) > 0 {
-			c.JSON(http.StatusNotImplemented, gin.H{"error": "file_ids referencing pre-uploaded files are not yet supported; use multipart/form-data"})
-			return
+		for _, fid := range req.FileIDs {
+			uf, ok := globalFilesStore.get(fid)
+			if !ok {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "unknown file_id: " + fid})
+				return
+			}
+			files = append(files, fileEntry{
+				filename: uf.Filename,
+				mimeType: uf.MimeType,
+				content:  uf.Content,
+			})
 		}
 	}
 
@@ -495,5 +633,39 @@ func (s *Server) UploadVectorStoreFileBatchHandler(c *gin.Context) {
 		Status:        "completed",
 		FileCounts:    counts,
 		CreatedAt:     createdAt,
+	})
+}
+
+// GetVectorStoreFileBatchHandler handles GET /v1/vector_stores/:id/file_batches/:batch_id.
+// Since batches are processed synchronously, this always returns the completed
+// batch state derived from the current vector store file counts.
+func (s *Server) GetVectorStoreFileBatchHandler(c *gin.Context) {
+	if s.vectorStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "vector store not available"})
+		return
+	}
+	vsID := c.Param("id")
+	vs, err := s.vectorStore.GetVectorStore(vsID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	// Batch IDs are "batch_<vsID>" — verify the batch_id matches.
+	batchID := c.Param("batch_id")
+	if batchID != "batch_"+vsID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "batch not found: " + batchID})
+		return
+	}
+	c.JSON(http.StatusOK, fileBatchResult{
+		ID:            batchID,
+		Object:        "vector_store.file_batch",
+		VectorStoreID: vsID,
+		Status:        "completed",
+		FileCounts: fileBatchCounts{
+			Completed: vs.FileCounts.Completed,
+			Failed:    vs.FileCounts.Failed,
+			Total:     vs.FileCounts.Total,
+		},
+		CreatedAt: vs.CreatedAt,
 	})
 }

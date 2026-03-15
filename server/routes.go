@@ -1725,6 +1725,8 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	r.GET("/v1/vector_stores/:id/files/:file_id", s.GetVectorStoreFileHandler)
 	r.DELETE("/v1/vector_stores/:id/files/:file_id", s.DeleteVectorStoreFileHandler)
 	r.POST("/v1/vector_stores/:id/file_batches", s.UploadVectorStoreFileBatchHandler)
+	r.GET("/v1/vector_stores/:id/file_batches/:batch_id", s.GetVectorStoreFileBatchHandler)
+	r.POST("/v1/files", s.UploadFileHandler)
 
 	if rc != nil {
 		// wrap old with new

@@ -30,16 +30,31 @@ import (
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
+// ExpiresAfter mirrors the OpenAI vector store expiry policy.
+type ExpiresAfter struct {
+	// Anchor is the reference point for the TTL. Supported values:
+	// "last_active_at" (default) and "created_at".
+	Anchor string `json:"anchor"`
+	// Days is the number of days after the anchor time before the store expires.
+	// A value of 0 means no per-store expiry.
+	Days int `json:"days"`
+}
+
 // VectorStore is the metadata record for a vector store.
 type VectorStore struct {
-	ID        string    `json:"id"`
-	Object    string    `json:"object"` // always "vector_store"
-	Name      string    `json:"name"`
-	CreatedAt int64     `json:"created_at"`
-	Status    string    `json:"status"` // "completed" | "in_progress" | "expired"
-	FileCounts FileCounts `json:"file_counts"`
+	ID           string        `json:"id"`
+	Object       string        `json:"object"` // always "vector_store"
+	Name         string        `json:"name"`
+	CreatedAt    int64         `json:"created_at"`
+	LastActiveAt int64         `json:"last_active_at"`
+	Status       string        `json:"status"` // "completed" | "in_progress" | "expired"
+	FileCounts   FileCounts    `json:"file_counts"`
+	// ExpiresAfter is the per-store expiry policy. Nil means no per-store expiry.
+	ExpiresAfter *ExpiresAfter `json:"expires_after,omitempty"`
+	// ExpiresAt is the Unix timestamp when the store will expire, or 0 if none.
+	ExpiresAt    int64         `json:"expires_at,omitempty"`
 	// Metadata is an arbitrary JSON object supplied by the caller.
-	Metadata map[string]any `json:"metadata"`
+	Metadata     map[string]any `json:"metadata"`
 }
 
 // FileCounts mirrors the OpenAI vector store file_counts object.
@@ -113,12 +128,15 @@ func (s *Store) Close() error {
 
 func (s *Store) init() error {
 	_, err := s.conn.Exec(`
-		CREATE TABLE IF NOT EXISTS vector_stores (
-			id          TEXT PRIMARY KEY,
-			name        TEXT NOT NULL DEFAULT '',
-			created_at  INTEGER NOT NULL,
-			metadata    TEXT NOT NULL DEFAULT '{}'
-		);
+			CREATE TABLE IF NOT EXISTS vector_stores (
+				id                   TEXT PRIMARY KEY,
+				name                 TEXT NOT NULL DEFAULT '',
+				created_at           INTEGER NOT NULL,
+				last_active_at       INTEGER NOT NULL DEFAULT 0,
+				expires_after_days   INTEGER NOT NULL DEFAULT 0,
+				expires_after_anchor TEXT NOT NULL DEFAULT 'last_active_at',
+				metadata             TEXT NOT NULL DEFAULT '{}'
+			);
 
 		CREATE TABLE IF NOT EXISTS vs_files (
 			id              TEXT PRIMARY KEY,
@@ -146,8 +164,9 @@ func (s *Store) init() error {
 
 // ─── Vector Store CRUD ───────────────────────────────────────────────────────
 
-// CreateVectorStore creates a new vector store with the given name and metadata.
-func (s *Store) CreateVectorStore(name string, metadata map[string]any) (*VectorStore, error) {
+// CreateVectorStore creates a new vector store with the given name, metadata,
+// and optional per-store expiry policy.
+func (s *Store) CreateVectorStore(name string, metadata map[string]any, expiresAfter *ExpiresAfter) (*VectorStore, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -155,21 +174,41 @@ func (s *Store) CreateVectorStore(name string, metadata map[string]any) (*Vector
 	now := time.Now().Unix()
 	metaJSON, _ := json.Marshal(metadata)
 
+	days := 0
+	anchor := "last_active_at"
+	if expiresAfter != nil && expiresAfter.Days > 0 {
+		days = expiresAfter.Days
+		if expiresAfter.Anchor != "" {
+			anchor = expiresAfter.Anchor
+		}
+	}
+
 	_, err := s.conn.Exec(
-		`INSERT INTO vector_stores(id, name, created_at, metadata) VALUES (?,?,?,?)`,
-		id, name, now, string(metaJSON),
+		`INSERT INTO vector_stores(id, name, created_at, last_active_at, expires_after_days, expires_after_anchor, metadata)
+		 VALUES (?,?,?,?,?,?,?)`,
+		id, name, now, now, days, anchor, string(metaJSON),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("vectorstore: create: %w", err)
 	}
-	return &VectorStore{
-		ID:        id,
-		Object:    "vector_store",
-		Name:      name,
-		CreatedAt: now,
-		Status:    "completed",
-		Metadata:  metadata,
-	}, nil
+	vs := &VectorStore{
+		ID:           id,
+		Object:       "vector_store",
+		Name:         name,
+		CreatedAt:    now,
+		LastActiveAt: now,
+		Status:       "completed",
+		Metadata:     metadata,
+	}
+	if days > 0 {
+		vs.ExpiresAfter = &ExpiresAfter{Anchor: anchor, Days: days}
+		anchorTime := now
+		if anchor == "created_at" {
+			anchorTime = now
+		}
+		vs.ExpiresAt = anchorTime + int64(days)*86400
+	}
+	return vs, nil
 }
 
 // GetVectorStore retrieves a vector store by ID.
@@ -182,9 +221,12 @@ func (s *Store) GetVectorStore(id string) (*VectorStore, error) {
 func (s *Store) getVectorStore(id string) (*VectorStore, error) {
 	var vs VectorStore
 	var metaJSON string
+	var expiresAfterDays int
+	var expiresAfterAnchor string
 	err := s.conn.QueryRow(
-		`SELECT id, name, created_at, metadata FROM vector_stores WHERE id=?`, id,
-	).Scan(&vs.ID, &vs.Name, &vs.CreatedAt, &metaJSON)
+		`SELECT id, name, created_at, last_active_at, expires_after_days, expires_after_anchor, metadata
+		 FROM vector_stores WHERE id=?`, id,
+	).Scan(&vs.ID, &vs.Name, &vs.CreatedAt, &vs.LastActiveAt, &expiresAfterDays, &expiresAfterAnchor, &metaJSON)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("vectorstore: not found: %s", id)
 	}
@@ -195,6 +237,17 @@ func (s *Store) getVectorStore(id string) (*VectorStore, error) {
 	vs.Status = "completed"
 	_ = json.Unmarshal([]byte(metaJSON), &vs.Metadata)
 	vs.FileCounts = s.fileCounts(id)
+	if expiresAfterDays > 0 {
+		vs.ExpiresAfter = &ExpiresAfter{Anchor: expiresAfterAnchor, Days: expiresAfterDays}
+		anchorTime := vs.LastActiveAt
+		if expiresAfterAnchor == "created_at" {
+			anchorTime = vs.CreatedAt
+		}
+		vs.ExpiresAt = anchorTime + int64(expiresAfterDays)*86400
+		if vs.ExpiresAt <= time.Now().Unix() {
+			vs.Status = "expired"
+		}
+	}
 	return &vs, nil
 }
 
@@ -506,6 +559,13 @@ func (s *Store) Search(vsIDs []string, queryVec []float32, maxResults int) ([]Ch
 		r.ChunkResult.Score = r.score
 		out[i] = r.ChunkResult
 	}
+	// Update last_active_at for all searched stores (supports "last_active_at" TTL).
+	// We release the read lock first to avoid a lock upgrade deadlock.
+	s.mu.RUnlock()
+	for _, id := range vsIDs {
+		s.touchLastActive(id)
+	}
+	s.mu.RLock() // re-acquire so defer RUnlock() is balanced
 	return out, nil
 }
 
@@ -594,21 +654,52 @@ func newID(n int) string {
 
 // ─── TTL eviction ────────────────────────────────────────────────────────────
 
-// EvictOlderThan deletes all vector stores whose created_at timestamp is older
-// than the given cutoff time. Cascading foreign keys automatically remove all
-// associated vs_files and vs_chunks rows. Returns the number of stores deleted.
+// touchLastActive updates the last_active_at timestamp for a vector store.
+// Called internally after a successful Search to support "last_active_at" TTL.
+func (s *Store) touchLastActive(vsID string) {
+	_, _ = s.conn.Exec(
+		`UPDATE vector_stores SET last_active_at=? WHERE id=?`,
+		time.Now().Unix(), vsID,
+	)
+}
+
+// EvictOlderThan deletes all vector stores that should be expired:
+//   - Stores with no per-store expiry whose created_at is older than cutoff.
+//   - Stores with a per-store ExpiresAfter policy whose computed expiry has passed.
+//
+// Cascading foreign keys automatically remove all associated vs_files and
+// vs_chunks rows. Returns the total number of stores deleted.
 func (s *Store) EvictOlderThan(cutoff time.Time) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.conn.Exec(
-		`DELETE FROM vector_stores WHERE created_at < ?`,
+	now := time.Now().Unix()
+	// Delete stores with no per-store TTL that are older than the global cutoff.
+	res1, err := s.conn.Exec(
+		`DELETE FROM vector_stores WHERE expires_after_days = 0 AND created_at < ?`,
 		cutoff.Unix(),
 	)
 	if err != nil {
-		return 0, fmt.Errorf("vectorstore: evict: %w", err)
+		return 0, fmt.Errorf("vectorstore: evict global: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	n1, _ := res1.RowsAffected()
+	// Delete stores with a per-store TTL whose expiry has passed.
+	// expires_at = anchor_time + expires_after_days * 86400
+	// anchor_time is last_active_at when anchor='last_active_at', else created_at.
+	res2, err := s.conn.Exec(`
+		DELETE FROM vector_stores
+		WHERE expires_after_days > 0
+		  AND (
+		    (expires_after_anchor = 'last_active_at' AND last_active_at + expires_after_days * 86400 <= ?)
+		    OR
+		    (expires_after_anchor != 'last_active_at' AND created_at + expires_after_days * 86400 <= ?)
+		  )`,
+		now, now,
+	)
+	if err != nil {
+		return n1, fmt.Errorf("vectorstore: evict per-store: %w", err)
+	}
+	n2, _ := res2.RowsAffected()
+	return n1 + n2, nil
 }
 
 // StartEviction launches a background goroutine that calls EvictOlderThan

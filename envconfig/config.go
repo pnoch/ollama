@@ -216,6 +216,16 @@ var (
 	VectorStoreTTLDays = Uint("OLLAMA_VECTORSTORE_TTL_DAYS", 0)
 )
 
+var (
+	// WebSearchCitationPrompt overrides the system prompt injected into web
+	// search follow-up calls to encourage the model to include source URLs.
+	// An empty string uses the built-in default instruction.
+	WebSearchCitationPrompt = String("OLLAMA_WEB_SEARCH_CITATION_PROMPT")
+	// WebSearchMaxResults sets the default number of web search results
+	// fetched per query. Can be overridden per-request via web_search_options.
+	WebSearchMaxResults = Uint("OLLAMA_WEB_SEARCH_MAX_RESULTS", 5)
+)
+
 func String(s string) func() string {
 	return func() string {
 		return Var(s)

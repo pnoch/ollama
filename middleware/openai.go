@@ -16,6 +16,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/openai"
 )
 
@@ -663,13 +664,14 @@ func ResponsesMiddleware() gin.HandlerFunc {
 		// writer with the agent loop that executes searches server-side and
 		// emits web_search_call events. This makes web_search_preview work
 		// identically for local models as it does for cloud models.
-		if _, hasWS := openai.HasWebSearchPreview(req.Tools); hasWS {
-			c.Writer = &ResponsesWebSearchWriter{
-				BaseWriter: BaseWriter{ResponseWriter: c.Writer},
-				inner:      w,
-				req:        req,
-				chatReq:    chatReq,
-			}
+			if wsTool, hasWS := openai.HasWebSearchPreview(req.Tools); hasWS {
+				c.Writer = &ResponsesWebSearchWriter{
+					BaseWriter:     BaseWriter{ResponseWriter: c.Writer},
+					inner:          w,
+					req:            req,
+					chatReq:        chatReq,
+					webSearchTool:  wsTool,
+				}
 		} else if fsTool, hasFS := openai.HasFileSearch(req.Tools); hasFS {
 			// If the request includes a file_search built-in tool, wrap the writer
 			// with the agent loop that queries the local vector store and emits
@@ -830,9 +832,10 @@ func ImageEditsMiddleware() gin.HandlerFunc {
 // the cloud proxy forwards the request verbatim; local models go through this writer.
 type ResponsesWebSearchWriter struct {
 	BaseWriter
-	inner   *ResponsesWriter
-	req     openai.ResponsesRequest
-	chatReq *api.ChatRequest
+	inner         *ResponsesWriter
+	req           openai.ResponsesRequest
+	chatReq       *api.ChatRequest
+	webSearchTool openai.ResponsesTool
 }
 
 const maxResponsesWebSearchLoops = 3
@@ -865,17 +868,22 @@ func (w *ResponsesWebSearchWriter) Write(data []byte) (int, error) {
 // ExtractWebSearchCitations can match them and produce url_citation annotations.
 const webSearchCitationInstruction = `When you reference information from the search results, include the source URL verbatim somewhere in your response text (e.g. "According to https://example.com/page, ..."). This allows citations to be linked automatically.`
 
-// injectCitationInstruction appends webSearchCitationInstruction to the last
+// injectCitationInstruction appends the citation instruction to the last
 // system or developer message in msgs, or prepends a new system message if
-// none exists. It returns the (possibly modified) slice.
+// none exists. The instruction text is taken from OLLAMA_WEB_SEARCH_CITATION_PROMPT
+// if set, otherwise the built-in default is used.
 func injectCitationInstruction(msgs []api.Message) []api.Message {
+	instruction := envconfig.WebSearchCitationPrompt()
+	if instruction == "" {
+		instruction = webSearchCitationInstruction
+	}
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if msgs[i].Role == "system" || msgs[i].Role == "developer" {
-			msgs[i].Content = strings.TrimRight(msgs[i].Content, " \n") + "\n\n" + webSearchCitationInstruction
+			msgs[i].Content = strings.TrimRight(msgs[i].Content, " \n") + "\n\n" + instruction
 			return msgs
 		}
 	}
-	return append([]api.Message{{Role: "system", Content: webSearchCitationInstruction}}, msgs...)
+	return append([]api.Message{{Role: "system", Content: instruction}}, msgs...)
 }
 
 func (w *ResponsesWebSearchWriter) runLoop(initialResp api.ChatResponse, initialCall api.ToolCall) (int, error) {
@@ -905,7 +913,7 @@ func (w *ResponsesWebSearchWriter) runLoop(initialResp api.ChatResponse, initial
 		}
 
 		// Execute the web search.
-		results, err := responsesWebSearch(query)
+		results, err := responsesWebSearch(query, w.webSearchTool.MaxResults)
 		if err != nil {
 			// On search failure, fall back to passing the original response through.
 			break
@@ -1007,7 +1015,7 @@ func responsesExtractQuery(tc *api.ToolCall) string {
 
 // responsesWebSearch calls ollama.com/api/web_search and returns results as
 // []map[string]any for embedding in Responses API events.
-func responsesWebSearch(query string) ([]map[string]any, error) {
+func responsesWebSearch(query string, maxResults int) ([]map[string]any, error) {
 	type searchReq struct {
 		Query      string `json:"query"`
 		MaxResults int    `json:"max_results,omitempty"`
@@ -1021,7 +1029,10 @@ func responsesWebSearch(query string) ([]map[string]any, error) {
 		Results []searchResult `json:"results"`
 	}
 
-	body, err := json.Marshal(searchReq{Query: query, MaxResults: 5})
+	if maxResults <= 0 {
+		maxResults = int(envconfig.WebSearchMaxResults())
+	}
+	body, err := json.Marshal(searchReq{Query: query, MaxResults: maxResults})
 	if err != nil {
 		return nil, err
 	}

@@ -55,7 +55,7 @@ func openTestStore(t *testing.T) *vectorstore.Store {
 func TestCreateAndGetVectorStore(t *testing.T) {
 	s := openTestStore(t)
 
-	vs, err := s.CreateVectorStore("my-store", map[string]any{"env": "test"})
+	vs, err := s.CreateVectorStore("my-store", map[string]any{"env": "test"}, nil)
 	if err != nil {
 		t.Fatalf("CreateVectorStore: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestListVectorStores(t *testing.T) {
 	s := openTestStore(t)
 
 	for _, name := range []string{"alpha", "beta", "gamma"} {
-		if _, err := s.CreateVectorStore(name, nil); err != nil {
+		if _, err := s.CreateVectorStore(name, nil, nil); err != nil {
 			t.Fatalf("CreateVectorStore(%q): %v", name, err)
 		}
 	}
@@ -96,7 +96,7 @@ func TestListVectorStores(t *testing.T) {
 func TestDeleteVectorStore(t *testing.T) {
 	s := openTestStore(t)
 
-	vs, _ := s.CreateVectorStore("to-delete", nil)
+	vs, _ := s.CreateVectorStore("to-delete", nil, nil)
 	if err := s.DeleteVectorStore(vs.ID); err != nil {
 		t.Fatalf("DeleteVectorStore: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestAddAndListFiles(t *testing.T) {
 	s := openTestStore(t)
 	embed := stubEmbed(16)
 
-	vs, _ := s.CreateVectorStore("docs", nil)
+	vs, _ := s.CreateVectorStore("docs", nil, nil)
 
 	content := []byte("Hello world. This is a test document. It has multiple sentences.")
 	f, err := s.AddFile(vs.ID, "hello.txt", "text/plain", content, "stub", embed)
@@ -139,7 +139,7 @@ func TestDeleteFile(t *testing.T) {
 	s := openTestStore(t)
 	embed := stubEmbed(16)
 
-	vs, _ := s.CreateVectorStore("docs", nil)
+	vs, _ := s.CreateVectorStore("docs", nil, nil)
 	f, _ := s.AddFile(vs.ID, "a.txt", "text/plain", []byte("some text"), "stub", embed)
 
 	if err := s.DeleteFile(vs.ID, f.ID); err != nil {
@@ -158,7 +158,7 @@ func TestSearchReturnsRelevantChunks(t *testing.T) {
 	s := openTestStore(t)
 	embed := stubEmbed(32)
 
-	vs, _ := s.CreateVectorStore("kb", nil)
+	vs, _ := s.CreateVectorStore("kb", nil, nil)
 
 	docs := []struct {
 		name    string
@@ -196,8 +196,8 @@ func TestSearchAcrossMultipleVectorStores(t *testing.T) {
 	s := openTestStore(t)
 	embed := stubEmbed(16)
 
-	vs1, _ := s.CreateVectorStore("store1", nil)
-	vs2, _ := s.CreateVectorStore("store2", nil)
+	vs1, _ := s.CreateVectorStore("store1", nil, nil)
+	vs2, _ := s.CreateVectorStore("store2", nil, nil)
 
 	s.AddFile(vs1.ID, "a.txt", "text/plain", []byte("cats and dogs"), "stub", embed)
 	s.AddFile(vs2.ID, "b.txt", "text/plain", []byte("birds and fish"), "stub", embed)
@@ -216,7 +216,7 @@ func TestSearchEmptyStore(t *testing.T) {
 	s := openTestStore(t)
 	embed := stubEmbed(16)
 
-	vs, _ := s.CreateVectorStore("empty", nil)
+	vs, _ := s.CreateVectorStore("empty", nil, nil)
 	queryVec, _ := embed("anything")
 	results, err := s.Search([]string{vs.ID}, queryVec, 5)
 	if err != nil {
@@ -238,7 +238,7 @@ func TestChunkTextSplitsLongContent(t *testing.T) {
 
 	s := openTestStore(t)
 	embed := stubEmbed(8)
-	vs, _ := s.CreateVectorStore("big", nil)
+	vs, _ := s.CreateVectorStore("big", nil, nil)
 
 	_, err := s.AddFile(vs.ID, "big.txt", "text/plain", long, "stub", embed)
 	if err != nil {
@@ -270,7 +270,7 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 		}
 		t.Fatalf("Open (first): %v", err)
 	}
-	vs, _ := s1.CreateVectorStore("persist-test", nil)
+	vs, _ := s1.CreateVectorStore("persist-test", nil, nil)
 	s1.AddFile(vs.ID, "doc.txt", "text/plain", []byte("persistent content"), "stub", embed)
 	s1.Close()
 
@@ -304,11 +304,11 @@ func TestEvictOlderThan(t *testing.T) {
 	s := openTestStore(t)
 
 	// Create two vector stores.
-	old, err := s.CreateVectorStore("old-store", nil)
+	old, err := s.CreateVectorStore("old-store", nil, nil)
 	if err != nil {
 		t.Fatalf("CreateVectorStore old: %v", err)
 	}
-	recent, err := s.CreateVectorStore("recent-store", nil)
+	recent, err := s.CreateVectorStore("recent-store", nil, nil)
 	if err != nil {
 		t.Fatalf("CreateVectorStore recent: %v", err)
 	}

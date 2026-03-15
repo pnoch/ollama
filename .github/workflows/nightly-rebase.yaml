@@ -33,6 +33,17 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Enable rerere so previously-resolved conflicts are replayed automatically.
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+
+      - name: Restore rerere cache
+        uses: actions/cache@v4
+        with:
+          path: .git/rr-cache
+          key: rerere-${{ github.sha }}
+          restore-keys: |
+            rerere-
 
       - name: Add upstream remote
         run: |
@@ -50,13 +61,24 @@ jobs:
         id: rebase
         if: steps.check.outputs.behind != '0'
         run: |
-          # Attempt the rebase. On conflict, capture the error and abort.
+          # Attempt the rebase. rerere will replay any previously-recorded
+          # conflict resolutions automatically (rerere.autoupdate=true means
+          # resolved files are staged without manual git add).
           if ! GIT_EDITOR=true git rebase upstream/main; then
             echo "REBASE_FAILED=true" >> "$GITHUB_ENV"
+            # Save any new rerere recordings even on failure so future runs
+            # can replay them.
             git rebase --abort || true
             exit 0
           fi
           echo "REBASE_FAILED=false" >> "$GITHUB_ENV"
+
+      - name: Save rerere cache
+        if: always() && steps.check.outputs.behind != '0'
+        uses: actions/cache/save@v4
+        with:
+          path: .git/rr-cache
+          key: rerere-${{ github.sha }}
 
       - name: Set up Go
         if: env.REBASE_FAILED == 'false' && steps.check.outputs.behind != '0'

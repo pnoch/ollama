@@ -350,6 +350,9 @@ type ResponsesTool struct {
 	// web_search_preview fields
 	SearchContextSize string   `json:"search_context_size,omitempty"` // "low", "medium", "high"
 	AllowedDomains    []string `json:"allowed_domains,omitempty"`
+	// MaxResults controls how many search results are fetched per query.
+	// 0 means use the server default (OLLAMA_WEB_SEARCH_MAX_RESULTS, default 5).
+	MaxResults        int      `json:"max_results,omitempty"`
 
 	// file_search fields
 	VectorStoreIDs []string `json:"vector_store_ids,omitempty"`
@@ -1518,12 +1521,23 @@ func (c *ResponsesStreamConverter) FileSearchCallEvents(fsItemID, query string, 
 			"query":  query,
 		},
 	}))
+	// response.file_search_call.searching — signals the search is underway.
+	events = append(events, c.newEvent("response.file_search_call.searching", map[string]any{
+		"output_index": c.outputIndex,
+		"item_id":      fsItemID,
+	}))
+	// response.file_search_call.results — delivers the retrieved chunks.
+	events = append(events, c.newEvent("response.file_search_call.results", map[string]any{
+		"output_index": c.outputIndex,
+		"item_id":      fsItemID,
+		"results":      chunks,
+	}))
 	// response.output_item.done (status: completed)
 	fsItem := map[string]any{
-		"id":     fsItemID,
-		"type":   "file_search_call",
-		"status": "completed",
-		"query":  query,
+		"id":      fsItemID,
+		"type":    "file_search_call",
+		"status":  "completed",
+		"query":   query,
 		"results": chunks,
 	}
 	events = append(events, c.newEvent("response.output_item.done", map[string]any{
