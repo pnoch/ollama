@@ -1672,6 +1672,9 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	// at the /backend-api/api/codex/usage alias registered below.
 	r.GET("/api/codex/usage", s.CodexUsageHandler)
 	r.GET("/backend-api/api/codex/usage", s.CodexUsageHandler)
+	// ChatGPT path style: when chatgpt_base_url contains /backend-api, the
+	// Codex backend-client uses PathStyle::ChatGptApi and calls /wham/usage.
+	r.GET("/backend-api/wham/usage", s.CodexUsageHandler)
 
 	// Local model cache management (new implementation is at end of function)
 	r.POST("/api/pull", s.PullHandler)
