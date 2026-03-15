@@ -59,6 +59,17 @@ func (c *Codex) RunContext(ctx context.Context, model string, args []string) err
 
 	cmdArgs := c.args(model, args)
 
+	// Point Codex's chatgpt_base_url at the local Ollama server so that the
+	// /status slash-command's rate-limit poller calls our local
+	// GET /backend-api/api/codex/usage endpoint instead of chatgpt.com.
+	// Only inject when the user has not already set a custom chatgpt_base_url
+	// in their ~/.codex/config.toml (we detect this by checking whether the
+	// user has passed their own -c chatgpt_base_url= override in extra args).
+	if !containsConfigKey(args, "chatgpt_base_url") {
+		chatgptBaseURL := envconfig.Host().String() + "/backend-api/"
+		cmdArgs = append(cmdArgs, "-c", "chatgpt_base_url="+chatgptBaseURL)
+	}
+
 	// Add model catalog if available (don't fail if it doesn't work)
 	catalogArg, cleanup, err := codexModelCatalogArg(model)
 	if err == nil && catalogArg != "" {
@@ -531,4 +542,28 @@ func codexModelDescription(model string) string {
 		return desc
 	}
 	return model
+}
+
+// containsConfigKey reports whether the extra args slice contains a -c flag
+// that sets the given configuration key.  It is used to avoid overriding a
+// user-supplied -c chatgpt_base_url=... override.
+func containsConfigKey(args []string, key string) bool {
+	for i, arg := range args {
+		// Handle both "-c key=value" (two tokens) and "-c=key=value" (one token).
+		var value string
+		switch {
+		case arg == "-c" || arg == "--config":
+			if i+1 < len(args) {
+				value = args[i+1]
+			}
+		case strings.HasPrefix(arg, "-c=") || strings.HasPrefix(arg, "--config="):
+			_, value, _ = strings.Cut(arg, "=")
+		default:
+			continue
+		}
+		if k, _, ok := strings.Cut(value, "="); ok && k == key {
+			return true
+		}
+	}
+	return false
 }

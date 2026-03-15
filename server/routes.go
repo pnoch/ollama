@@ -1665,6 +1665,14 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	r.GET("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
 	r.GET("/api/status", s.StatusHandler)
 
+	// Codex usage / rate-limit endpoint.  The Codex TUI's /status slash-command
+	// calls GET {chatgpt_base_url}/api/codex/usage to populate rate-limit bars.
+	// When Ollama is the provider, chatgpt_base_url is set to
+	// http://localhost:11434/backend-api/ by the launcher so requests arrive
+	// at the /backend-api/api/codex/usage alias registered below.
+	r.GET("/api/codex/usage", s.CodexUsageHandler)
+	r.GET("/backend-api/api/codex/usage", s.CodexUsageHandler)
+
 	// Local model cache management (new implementation is at end of function)
 	r.POST("/api/pull", s.PullHandler)
 	r.POST("/api/push", s.PushHandler)

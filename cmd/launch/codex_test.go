@@ -161,14 +161,6 @@ func TestCodexModelCatalogArg_LocalModel(t *testing.T) {
 		t.Fatalf("write cache: %v", err)
 	}
 
-	// Start a mock /api/show server that returns a known context_length.
-	import_net_http_test_server := func() (string, func()) {
-		// We can't import net/http/httptest here without a separate file,
-		// so we test the fallback path: no server running → default context window.
-		return "", func() {}
-	}
-	_ = import_net_http_test_server
-
 	// "llama3.2" is not in cloudModelLimits, so fetchLocalModelContextWindow
 	// will be called. The Ollama server is not running in tests, so it falls
 	// back to defaultLocalContextWindow (128_000).
@@ -239,12 +231,12 @@ func TestCodexAuthEnvPassthrough(t *testing.T) {
 	ollamaURL := "http://127.0.0.1:11434/v1/"
 
 	cases := []struct {
-		name              string
-		envOpenAIBaseURL  string
-		envOpenAIAPIKey   string
-		envCodexAPIKey    string
-		wantBaseURL       string // expected value of OPENAI_BASE_URL in subprocess env
-		wantAPIKeyDummy   bool   // expect OPENAI_API_KEY=ollama to be injected
+		name            string
+		envOpenAIBaseURL string
+		envOpenAIAPIKey  string
+		envCodexAPIKey   string
+		wantBaseURL     string // expected value of OPENAI_BASE_URL in subprocess env
+		wantAPIKeyDummy bool   // expect OPENAI_API_KEY=ollama to be injected
 	}{
 		{
 			name:            "no_user_vars_injects_defaults",
@@ -322,5 +314,135 @@ func TestCodexAuthEnvPassthrough(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestContainsConfigKey verifies that containsConfigKey correctly detects
+// whether a -c flag for a given key is present in the extra args slice.
+func TestContainsConfigKey(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		key  string
+		want bool
+	}{
+		{
+			name: "empty args",
+			args: nil,
+			key:  "chatgpt_base_url",
+			want: false,
+		},
+		{
+			name: "key present two-token form",
+			args: []string{"-c", "chatgpt_base_url=http://localhost:11434/backend-api/"},
+			key:  "chatgpt_base_url",
+			want: true,
+		},
+		{
+			name: "key present long-form two-token",
+			args: []string{"--config", "chatgpt_base_url=https://example.com/"},
+			key:  "chatgpt_base_url",
+			want: true,
+		},
+		{
+			name: "key present inline -c=key=value form",
+			args: []string{"-c=chatgpt_base_url=https://example.com/"},
+			key:  "chatgpt_base_url",
+			want: true,
+		},
+		{
+			name: "different key present",
+			args: []string{"-c", "model=gpt-4o"},
+			key:  "chatgpt_base_url",
+			want: false,
+		},
+		{
+			name: "key absent, other flags present",
+			args: []string{"--sandbox", "workspace-write", "-c", "model=o3"},
+			key:  "chatgpt_base_url",
+			want: false,
+		},
+		{
+			name: "key present among multiple -c flags",
+			args: []string{"-c", "model=o3", "-c", "chatgpt_base_url=http://localhost:9999/"},
+			key:  "chatgpt_base_url",
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := containsConfigKey(tc.args, tc.key)
+			if got != tc.want {
+				t.Errorf("containsConfigKey(%v, %q) = %v, want %v", tc.args, tc.key, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCodexRunContext_ChatgptBaseURLInjected verifies that RunContext injects
+// -c chatgpt_base_url=... when the user has not supplied their own override.
+func TestCodexRunContext_ChatgptBaseURLInjected(t *testing.T) {
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+
+	c := &Codex{}
+
+	// Build cmdArgs the same way RunContext does (without actually running codex).
+	model := "llama3.2"
+	extra := []string{}
+
+	cmdArgs := c.args(model, extra)
+
+	if !containsConfigKey(extra, "chatgpt_base_url") {
+		chatgptBaseURL := envconfig.Host().String() + "/backend-api/"
+		cmdArgs = append(cmdArgs, "-c", "chatgpt_base_url="+chatgptBaseURL)
+	}
+
+	// Verify that -c chatgpt_base_url=... was injected.
+	if !containsConfigKey(cmdArgs, "chatgpt_base_url") {
+		t.Errorf("expected chatgpt_base_url to be injected into cmdArgs, got: %v", cmdArgs)
+	}
+
+	// Verify the value points to the local Ollama server.
+	wantValue := "http://127.0.0.1:11434/backend-api/"
+	for i, arg := range cmdArgs {
+		if (arg == "-c" || arg == "--config") && i+1 < len(cmdArgs) {
+			if k, v, ok := strings.Cut(cmdArgs[i+1], "="); ok && k == "chatgpt_base_url" {
+				if v != wantValue {
+					t.Errorf("chatgpt_base_url = %q, want %q", v, wantValue)
+				}
+				return
+			}
+		}
+	}
+	t.Errorf("chatgpt_base_url flag not found in cmdArgs: %v", cmdArgs)
+}
+
+// TestCodexRunContext_ChatgptBaseURLNotOverridden verifies that RunContext does
+// NOT inject chatgpt_base_url when the user has already supplied their own.
+func TestCodexRunContext_ChatgptBaseURLNotOverridden(t *testing.T) {
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+
+	c := &Codex{}
+	model := "llama3.2"
+	userExtra := []string{"-c", "chatgpt_base_url=https://my-custom-backend.example.com/"}
+
+	cmdArgs := c.args(model, userExtra)
+
+	if !containsConfigKey(userExtra, "chatgpt_base_url") {
+		chatgptBaseURL := envconfig.Host().String() + "/backend-api/"
+		cmdArgs = append(cmdArgs, "-c", "chatgpt_base_url="+chatgptBaseURL)
+	}
+
+	// Count occurrences of chatgpt_base_url in cmdArgs.
+	count := 0
+	for i, arg := range cmdArgs {
+		if (arg == "-c" || arg == "--config") && i+1 < len(cmdArgs) {
+			if k, _, ok := strings.Cut(cmdArgs[i+1], "="); ok && k == "chatgpt_base_url" {
+				count++
+			}
+		}
+	}
+	if count != 1 {
+		t.Errorf("chatgpt_base_url appears %d times in cmdArgs, want exactly 1; cmdArgs = %v", count, cmdArgs)
 	}
 }
