@@ -72,17 +72,25 @@ func (c *Codex) RunContext(ctx context.Context, model string, args []string) err
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	// Always point the default OpenAI provider at the local Ollama server so
-	// the selected Ollama model works out of the box. If the user has a real
-	// OPENAI_API_KEY set in their environment, preserve it so that native
-	// OpenAI models chosen from Codex's own model picker can also be used.
-	env := append(os.Environ(),
-		"OPENAI_BASE_URL="+envconfig.Host().String()+"/v1/",
-	)
-	// Only override OPENAI_API_KEY with the dummy value when the user has not
-	// already set a real key; this allows Codex's native model picker to
-	// authenticate against api.openai.com for non-Ollama models.
-	if os.Getenv("OPENAI_API_KEY") == "" {
+	// Build the subprocess environment starting from the current process
+	// environment so that all user-configured auth vars are inherited:
+	//   OPENAI_API_KEY / CODEX_API_KEY  – standard and Codex-specific keys
+	//   OPENAI_ORG_ID / OPENAI_PROJECT_ID – organisation / project scoping
+	//   AZURE_OPENAI_API_KEY            – Azure OpenAI key
+	//   Any custom env_key from ~/.codex/config.toml (MISTRAL_API_KEY, etc.)
+	//
+	// OPENAI_BASE_URL is only set to the local Ollama endpoint when the user
+	// has not already configured a custom base URL (Azure endpoint, proxy,
+	// data-residency URL, etc.).  Preserving the user's value lets all
+	// provider configs in ~/.codex/config.toml work without interference.
+	env := os.Environ()
+	if os.Getenv("OPENAI_BASE_URL") == "" {
+		env = append(env, "OPENAI_BASE_URL="+envconfig.Host().String()+"/v1/")
+	}
+	// Only inject the dummy API key when neither OPENAI_API_KEY nor the
+	// Codex-specific CODEX_API_KEY is set, so that real keys are never
+	// shadowed by the placeholder value.
+	if os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("CODEX_API_KEY") == "" {
 		env = append(env, "OPENAI_API_KEY=ollama")
 	}
 	cmd.Env = env

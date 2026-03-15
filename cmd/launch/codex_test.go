@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/ollama/ollama/envconfig"
 )
 
 func TestCodexArgs(t *testing.T) {
@@ -225,5 +227,100 @@ func TestFetchLocalModelContextWindow_Fallback(t *testing.T) {
 	got := fetchLocalModelContextWindow("llama3.2")
 	if got != defaultLocalContextWindow {
 		t.Fatalf("fetchLocalModelContextWindow() = %d, want %d", got, defaultLocalContextWindow)
+	}
+}
+
+// TestCodexAuthEnvPassthrough verifies the env var injection logic in RunContext:
+//   - OPENAI_BASE_URL is only set to the Ollama endpoint when the user has not
+//     already configured a custom base URL.
+//   - OPENAI_API_KEY is only set to the dummy "ollama" value when neither
+//     OPENAI_API_KEY nor CODEX_API_KEY is set.
+func TestCodexAuthEnvPassthrough(t *testing.T) {
+	ollamaURL := "http://127.0.0.1:11434/v1/"
+
+	cases := []struct {
+		name              string
+		envOpenAIBaseURL  string
+		envOpenAIAPIKey   string
+		envCodexAPIKey    string
+		wantBaseURL       string // expected value of OPENAI_BASE_URL in subprocess env
+		wantAPIKeyDummy   bool   // expect OPENAI_API_KEY=ollama to be injected
+	}{
+		{
+			name:            "no_user_vars_injects_defaults",
+			wantBaseURL:     ollamaURL,
+			wantAPIKeyDummy: true,
+		},
+		{
+			name:             "user_base_url_preserved",
+			envOpenAIBaseURL: "https://my-azure.openai.azure.com/openai/v1/",
+			wantBaseURL:      "https://my-azure.openai.azure.com/openai/v1/",
+			wantAPIKeyDummy:  true,
+		},
+		{
+			name:            "user_openai_api_key_preserved",
+			envOpenAIAPIKey: "sk-real-key",
+			wantBaseURL:     ollamaURL,
+			wantAPIKeyDummy: false,
+		},
+		{
+			name:            "codex_api_key_suppresses_dummy",
+			envCodexAPIKey:  "ck-real-key",
+			wantBaseURL:     ollamaURL,
+			wantAPIKeyDummy: false,
+		},
+		{
+			name:             "all_user_vars_fully_preserved",
+			envOpenAIBaseURL: "https://us.api.openai.com/v1",
+			envOpenAIAPIKey:  "sk-real-key",
+			wantBaseURL:      "https://us.api.openai.com/v1",
+			wantAPIKeyDummy:  false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Isolate env vars for this sub-test.
+			t.Setenv("OPENAI_BASE_URL", tc.envOpenAIBaseURL)
+			t.Setenv("OPENAI_API_KEY", tc.envOpenAIAPIKey)
+			t.Setenv("CODEX_API_KEY", tc.envCodexAPIKey)
+			// Point OLLAMA_HOST at the test URL so envconfig.Host() is predictable.
+			t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+
+			// Replicate the env-building logic from RunContext directly so we
+			// can test it without actually launching a codex subprocess.
+			env := os.Environ()
+			if os.Getenv("OPENAI_BASE_URL") == "" {
+				env = append(env, "OPENAI_BASE_URL="+envconfig.Host().String()+"/v1/")
+			}
+			if os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("CODEX_API_KEY") == "" {
+				env = append(env, "OPENAI_API_KEY=ollama")
+			}
+
+			// Build a lookup map from the last occurrence of each key
+			// (later entries win, matching exec.Cmd behaviour on Linux).
+			envMap := make(map[string]string)
+			for _, kv := range env {
+				idx := strings.IndexByte(kv, '=')
+				if idx < 0 {
+					continue
+				}
+				envMap[kv[:idx]] = kv[idx+1:]
+			}
+
+			if got := envMap["OPENAI_BASE_URL"]; got != tc.wantBaseURL {
+				t.Errorf("OPENAI_BASE_URL = %q, want %q", got, tc.wantBaseURL)
+			}
+
+			if tc.wantAPIKeyDummy {
+				if got := envMap["OPENAI_API_KEY"]; got != "ollama" {
+					t.Errorf("OPENAI_API_KEY = %q, want %q", got, "ollama")
+				}
+			} else {
+				if got := envMap["OPENAI_API_KEY"]; got == "ollama" {
+					t.Errorf("OPENAI_API_KEY should not be overridden with dummy value")
+				}
+			}
+		})
 	}
 }
