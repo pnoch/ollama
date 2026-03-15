@@ -168,27 +168,49 @@ func openAIPassthroughMiddleware() gin.HandlerFunc {
 		//     model (gpt-5.4, o3, etc.) inside Codex while logged in via OAuth.
 		//  2. OPENAI_API_KEY env var or stored key in ~/.codex/auth.json.
 		//  3. Any other real credential in the incoming Authorization header.
+		incomingAuthHeader := c.GetHeader("Authorization")
+		incomingToken := strings.TrimSpace(strings.TrimPrefix(incomingAuthHeader, "Bearer "))
+		slog.Info("openai proxy: credential resolution",
+			"path", c.Request.URL.Path,
+			"incoming_auth_present", incomingAuthHeader != "",
+			"incoming_token_prefix", safePrefix(incomingToken, 8),
+			"incoming_is_real", isRealCredential(incomingAuthHeader),
+			"incoming_is_jwt", isChatGPTOAuthToken(incomingToken),
+			"env_OPENAI_API_KEY", safePrefix(os.Getenv("OPENAI_API_KEY"), 8),
+			"stored_key_prefix", safePrefix(loadStoredOpenAIAPIKey(), 8),
+		)
 		var apiKey string
-		if incomingAuth := c.GetHeader("Authorization"); isRealCredential(incomingAuth) {
-			incomingToken := strings.TrimSpace(strings.TrimPrefix(incomingAuth, "Bearer "))
-			if isChatGPTOAuthToken(incomingToken) {
-				// Always prefer the OAuth JWT so it routes to chatgpt.com.
-				apiKey = incomingToken
-			}
+		if isRealCredential(incomingAuthHeader) && isChatGPTOAuthToken(incomingToken) {
+			// Always prefer the OAuth JWT so it routes to chatgpt.com.
+			apiKey = incomingToken
+			slog.Info("openai proxy: using incoming OAuth JWT")
 		}
 		if apiKey == "" {
 			apiKey = openAIAPIKey()
-		}
-		if (apiKey == "" || apiKey == "ollama") {
-			// Last resort: use whatever real credential Codex sent.
-			if incomingAuth := c.GetHeader("Authorization"); isRealCredential(incomingAuth) {
-				apiKey = strings.TrimSpace(strings.TrimPrefix(incomingAuth, "Bearer "))
+			if apiKey != "" {
+				slog.Info("openai proxy: using stored/env API key",
+					"key_prefix", safePrefix(apiKey, 8),
+					"is_jwt", isChatGPTOAuthToken(apiKey),
+				)
 			}
 		}
+		if apiKey == "" || apiKey == "ollama" {
+			// Last resort: use whatever real credential Codex sent.
+			if isRealCredential(incomingAuthHeader) {
+				apiKey = incomingToken
+				slog.Info("openai proxy: falling back to incoming auth header")
+			}
+		}
+		slog.Info("openai proxy: resolved credential",
+			"apiKey_prefix", safePrefix(apiKey, 8),
+			"apiKey_is_jwt", isChatGPTOAuthToken(apiKey),
+			"apiKey_empty", apiKey == "",
+		)
 		if apiKey == "" {
 			// No API key configured — skip proxy and let the local handler
 			// attempt to serve the request (it will fail gracefully if the
 			// model is not found locally).
+			slog.Info("openai proxy: no credential, falling through to local handler")
 			c.Next()
 			return
 		}
@@ -211,12 +233,18 @@ func openAIPassthroughMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		if isModelLocalOrCloud(modelName) {
+		isLocal := isModelLocalOrCloud(modelName)
+		slog.Info("openai proxy: model check",
+			"model", modelName,
+			"is_local_or_cloud", isLocal,
+			"will_proxy", !isLocal,
+			"upstream", upstreamBaseURLForCredential(apiKey),
+		)
+		if isLocal {
 			// Local or explicit cloud model — do not proxy to OpenAI.
 			c.Next()
 			return
 		}
-
 		// The model is not local and not an explicit cloud model.  Proxy to
 		// the upstream OpenAI API.
 		proxyToOpenAI(c, body, apiKey)
@@ -516,4 +544,13 @@ func openAIProxyModelName(body []byte) (model.Name, bool) {
 		return model.Name{}, false
 	}
 	return ref.Name, true
+}
+
+// safePrefix returns the first n characters of s, or all of s if len(s) < n.
+// Used for logging credentials without exposing the full token.
+func safePrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
