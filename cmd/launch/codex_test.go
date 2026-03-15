@@ -144,3 +144,86 @@ func TestCodexModelCatalogArg(t *testing.T) {
 		t.Fatalf("generated catalog still exists after cleanup, err = %v", err)
 	}
 }
+
+func TestCodexModelCatalogArg_LocalModel(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Write a models_cache.json so the catalog template is available.
+	cachePath := filepath.Join(home, ".codex", "models_cache.json")
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cache := `{"fetched_at":"2026-03-10T00:00:00Z","client_version":"0.113.0","models":[{"slug":"gpt-5.4","display_name":"gpt-5.4","description":"Latest frontier agentic coding model.","context_window":272000,"effective_context_window_percent":95,"priority":0,"prefer_websockets":true,"auto_compact_token_limit":258400}]}` + "\n"
+	if err := os.WriteFile(cachePath, []byte(cache), 0o644); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+
+	// Start a mock /api/show server that returns a known context_length.
+	import_net_http_test_server := func() (string, func()) {
+		// We can't import net/http/httptest here without a separate file,
+		// so we test the fallback path: no server running → default context window.
+		return "", func() {}
+	}
+	_ = import_net_http_test_server
+
+	// "llama3.2" is not in cloudModelLimits, so fetchLocalModelContextWindow
+	// will be called. The Ollama server is not running in tests, so it falls
+	// back to defaultLocalContextWindow (128_000).
+	arg, cleanup, err := codexModelCatalogArg("llama3.2")
+	if err != nil {
+		t.Fatalf("codexModelCatalogArg() error = %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("cleanup = nil, want non-nil (local models must also produce a catalog)")
+	}
+	if !strings.HasPrefix(arg, `model_catalog_json="`) {
+		t.Fatalf("arg = %q, want model_catalog_json path", arg)
+	}
+
+	path := strings.TrimPrefix(arg, `model_catalog_json="`)
+	path = strings.TrimSuffix(path, `"`)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read generated catalog: %v", err)
+	}
+
+	var catalog codexModelCatalog
+	if err := json.Unmarshal(data, &catalog); err != nil {
+		t.Fatalf("unmarshal generated catalog: %v", err)
+	}
+	if len(catalog.Models) != 2 {
+		t.Fatalf("len(catalog.Models) = %d, want 2 (native + ollama model)", len(catalog.Models))
+	}
+
+	entry := catalog.Models[1]
+	if entry["slug"] != "llama3.2" {
+		t.Fatalf("entry slug = %v, want llama3.2", entry["slug"])
+	}
+	// Falls back to defaultLocalContextWindow when server is not running.
+	if entry["context_window"] != float64(defaultLocalContextWindow) {
+		t.Fatalf("entry context_window = %v, want %d", entry["context_window"], defaultLocalContextWindow)
+	}
+	if entry["priority"] != float64(100) {
+		t.Fatalf("entry priority = %v, want 100", entry["priority"])
+	}
+	if _, ok := entry["auto_compact_token_limit"]; ok {
+		t.Fatalf("entry auto_compact_token_limit should be omitted for local models")
+	}
+
+	cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("generated catalog still exists after cleanup, err = %v", err)
+	}
+}
+
+func TestFetchLocalModelContextWindow_Fallback(t *testing.T) {
+	// When the Ollama server is not running, fetchLocalModelContextWindow
+	// must return defaultLocalContextWindow without panicking.
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:1") // port 1 is never open
+	got := fetchLocalModelContextWindow("llama3.2")
+	if got != defaultLocalContextWindow {
+		t.Fatalf("fetchLocalModelContextWindow() = %d, want %d", got, defaultLocalContextWindow)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,10 +72,20 @@ func (c *Codex) RunContext(ctx context.Context, model string, args []string) err
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
+	// Always point the default OpenAI provider at the local Ollama server so
+	// the selected Ollama model works out of the box. If the user has a real
+	// OPENAI_API_KEY set in their environment, preserve it so that native
+	// OpenAI models chosen from Codex's own model picker can also be used.
+	env := append(os.Environ(),
 		"OPENAI_BASE_URL="+envconfig.Host().String()+"/v1/",
-		"OPENAI_API_KEY=ollama",
 	)
+	// Only override OPENAI_API_KEY with the dummy value when the user has not
+	// already set a real key; this allows Codex's native model picker to
+	// authenticate against api.openai.com for non-Ollama models.
+	if os.Getenv("OPENAI_API_KEY") == "" {
+		env = append(env, "OPENAI_API_KEY=ollama")
+	}
+	cmd.Env = env
 	return cmd.Run()
 }
 
@@ -370,10 +381,55 @@ type codexModelCatalog struct {
 	Models        []map[string]any `json:"models"`
 }
 
+// defaultLocalContextWindow is used when the Ollama /api/show endpoint is
+// unavailable or returns no context_length (e.g. model not yet pulled).
+const defaultLocalContextWindow = 128_000
+
+// fetchLocalModelContextWindow queries the running Ollama server for the
+// context window of a local model. It returns defaultLocalContextWindow on
+// any error so the caller never needs to handle the failure case.
+func fetchLocalModelContextWindow(model string) int {
+	type showReq struct {
+		Model string `json:"model"`
+	}
+	type showResp struct {
+		ModelInfo map[string]any `json:"model_info"`
+	}
+	body, _ := json.Marshal(showReq{Model: model})
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Post(
+		envconfig.Host().String()+"/api/show",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return defaultLocalContextWindow
+	}
+	defer resp.Body.Close()
+	var show showResp
+	if err := json.NewDecoder(resp.Body).Decode(&show); err != nil {
+		return defaultLocalContextWindow
+	}
+	// ModelInfo keys are "<arch>.context_length" (e.g. "llama.context_length").
+	// The /v1/show endpoint also exposes a bare "context_length" key.
+	for k, v := range show.ModelInfo {
+		if k == "context_length" || strings.HasSuffix(k, ".context_length") {
+			if n, ok := v.(float64); ok && n > 0 {
+				return int(n)
+			}
+		}
+	}
+	return defaultLocalContextWindow
+}
+
 func codexModelCatalogArg(model string) (string, func(), error) {
-	limit, ok := lookupCloudModelLimit(model)
-	if !ok {
-		return "", nil, nil
+	// Resolve context window: use the hardcoded cloud limit when available,
+	// otherwise query the local Ollama server (falls back to a safe default).
+	var contextWindow int
+	if limit, ok := lookupCloudModelLimit(model); ok {
+		contextWindow = limit.Context
+	} else {
+		contextWindow = fetchLocalModelContextWindow(model)
 	}
 
 	catalog, err := readCodexModelCatalogTemplate()
@@ -395,7 +451,7 @@ func codexModelCatalogArg(model string) (string, func(), error) {
 	entry["priority"] = 100
 	entry["availability_nux"] = nil
 	entry["upgrade"] = nil
-	entry["context_window"] = limit.Context
+	entry["context_window"] = contextWindow
 	entry["effective_context_window_percent"] = 95
 	entry["prefer_websockets"] = false
 	delete(entry, "auto_compact_token_limit")
