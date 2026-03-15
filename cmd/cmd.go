@@ -70,7 +70,41 @@ func init() {
 		if errors.Is(err, tui.ErrCancelled) {
 			return "", launch.ErrCancelled
 		}
+		if errors.Is(err, tui.ErrRightArrow) {
+			// Translate to launch.ErrRightArrow so launchSingleIntegration can
+			// open the session picker for the selected model.
+			return result, launch.ErrRightArrow
+		}
 		return result, err
+	}
+
+	launch.DefaultCodexSessionSelector = func(model string) (string, error) {
+		if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
+			return "", nil // headless: start new session
+		}
+		sessionID, err := tui.SelectCodexSession(model)
+		if errors.Is(err, tui.ErrCancelled) {
+			return "", launch.ErrCancelled
+		}
+		return sessionID, err
+	}
+
+	launch.DefaultCodexPicker = func(title string, items []launch.ModelItem, current string) (launch.CodexPickerSelection, error) {
+		if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
+			return launch.CodexPickerSelection{}, fmt.Errorf("model selection requires an interactive terminal; use --model to run in headless mode")
+		}
+		tuiItems := tui.ReorderItems(tui.ConvertItems(items))
+		result, err := tui.RunCodexPicker(tuiItems, current)
+		if err != nil {
+			return launch.CodexPickerSelection{}, err
+		}
+		if result.Cancelled {
+			return launch.CodexPickerSelection{}, launch.ErrCancelled
+		}
+		return launch.CodexPickerSelection{
+			Model:     result.Model,
+			SessionID: result.SessionID,
+		}, nil
 	}
 
 	launch.DefaultMultiSelector = func(title string, items []launch.ModelItem, preChecked []string) ([]string, error) {

@@ -23,6 +23,11 @@ var ErrCancelled = errors.New("cancelled")
 // errCancelled is kept as an internal alias for existing call sites.
 var errCancelled = ErrCancelled
 
+// ErrRightArrow is returned by a SingleSelector when the user pressed the right
+// arrow key on a model, signalling that a sub-picker (e.g. session picker) should
+// be shown for that model. The selected model name is returned alongside this error.
+var ErrRightArrow = errors.New("right arrow")
+
 // DefaultConfirmPrompt provides a TUI-based confirmation prompt.
 // When set, ConfirmPrompt delegates to it instead of using raw terminal I/O.
 var DefaultConfirmPrompt func(prompt string) (bool, error)
@@ -44,6 +49,26 @@ var DefaultMultiSelector MultiSelector
 // When set, ensureAuth uses it instead of plain text prompts.
 // Returns the signed-in username or an error.
 var DefaultSignIn func(modelName, signInURL string) (string, error)
+
+// DefaultCodexSessionSelector is an optional hook for showing a session picker
+// after the user presses right arrow on a model in the Codex model picker.
+// It receives the selected model name and returns the session ID to resume, or
+// an empty string to start a new session, or ErrCancelled to abort.
+var DefaultCodexSessionSelector func(model string) (sessionID string, err error)
+
+// CodexPickerSelection is the result of DefaultCodexPicker.
+type CodexPickerSelection struct {
+	// Model is the model the user selected.
+	Model string
+	// SessionID is the session to resume, or empty for a new session.
+	SessionID string
+}
+
+// DefaultCodexPicker is an optional hook that replaces the standard
+// DefaultSingleSelector for Codex. It shows a two-level model+session picker
+// and returns the selected model and optional session ID to resume.
+// Returns ErrCancelled if the user cancels.
+var DefaultCodexPicker func(title string, items []ModelItem, current string) (CodexPickerSelection, error)
 
 type launchConfirmPolicy struct {
 	yes               bool

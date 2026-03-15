@@ -257,12 +257,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "right", "l":
 			item := m.items[m.cursor]
-			if item.integration == "codex" && m.changeableItem(item) {
-				// For Codex, right opens session picker
-				integrationState := m.state.Integrations[item.integration]
-				m.openCodexSessionModal(integrationState.CurrentModel)
-				return m, nil
-			}
 			if item.isRunModel || m.changeableItem(item) {
 				m.selected = true
 				m.action = actionForMenuItem(item, true)

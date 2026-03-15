@@ -462,11 +462,46 @@ func (c *launcherClient) launchSingleIntegration(ctx context.Context, name strin
 	}
 
 	if needsConfigure {
-		selected, err := c.selectSingleModelWithSelector(ctx, fmt.Sprintf("Select model for %s:", runner), target, DefaultSingleSelector)
-		if err != nil {
-			return err
+		// For Codex, use the two-level model+session picker if available.
+		if name == "codex" && DefaultCodexPicker != nil {
+			items, _, err := c.loadSelectableModels(ctx, nil, target, "no models available")
+			if err != nil {
+				return err
+			}
+			sel, pickErr := DefaultCodexPicker(fmt.Sprintf("Select model for %s:", runner), items, target)
+			if errors.Is(pickErr, ErrCancelled) {
+				return nil
+			}
+			if pickErr != nil {
+				return pickErr
+			}
+			target = sel.Model
+			if sel.SessionID != "" {
+				req.ExtraArgs = append([]string{"resume", sel.SessionID}, req.ExtraArgs...)
+			}
+		} else {
+			selected, err := c.selectSingleModelWithSelector(ctx, fmt.Sprintf("Select model for %s:", runner), target, DefaultSingleSelector)
+			if errors.Is(err, ErrRightArrow) {
+				// User pressed right arrow on a model — show the session picker for it.
+				target = selected
+				if DefaultCodexSessionSelector != nil {
+					sessionID, sessErr := DefaultCodexSessionSelector(target)
+					if errors.Is(sessErr, ErrCancelled) {
+						return nil
+					}
+					if sessErr != nil {
+						return sessErr
+					}
+					if sessionID != "" {
+						req.ExtraArgs = append([]string{"resume", sessionID}, req.ExtraArgs...)
+					}
+				}
+			} else if err != nil {
+				return err
+			} else {
+				target = selected
+			}
 		}
-		target = selected
 	} else if err := c.ensureModelsReady(ctx, []string{target}); err != nil {
 		return err
 	}

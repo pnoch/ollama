@@ -1,8 +1,6 @@
 package tui
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -181,41 +179,10 @@ func TestMenuShowsInstallStatusAndHint(t *testing.T) {
 
 // ---- Session resume tests ----
 
-func TestCodexRightOpensSessionPicker(t *testing.T) {
-	// Create a fake codex session so ListCodexSessions returns something.
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	sessionPath := filepath.Join(home, ".codex", "sessions", "2026", "03", "10", "session.jsonl")
-	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	cwd := t.TempDir()
-	// Change to cwd so that os.Getwd() in openCodexSessionModal matches the session's cwd.
-	origDir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd: %v", err)
-	}
-	if err := os.Chdir(cwd); err != nil {
-		t.Fatalf("Chdir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(origDir) })
-	data := `{"payload":{"id":"session-123","timestamp":"2026-03-10T12:00:00Z","cwd":"` + cwd + `","model_provider":"ollama","git":{"branch":"main","repository_url":"https://github.com/acme/ollama.git"}}}` + "\n" +
-		`{"payload":{"model":"qwen3:8b"}}` + "\n" +
-		`{"payload":{"type":"user_message","message":"Fix the bug."}}` + "\n"
-	if err := os.WriteFile(sessionPath, []byte(data), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	otherSessionPath := filepath.Join(home, ".codex", "sessions", "2026", "03", "09", "session-other.jsonl")
-	if err := os.MkdirAll(filepath.Dir(otherSessionPath), 0o755); err != nil {
-		t.Fatalf("MkdirAll other: %v", err)
-	}
-	otherCWD := filepath.Join(home, "other-project")
-	otherData := `{"payload":{"id":"session-999","timestamp":"2026-03-10T11:00:00Z","cwd":"` + otherCWD + `","model_provider":"openai","git":{"branch":"feature","repository_url":"https://github.com/acme/ollama.git"}}}` + "\n" +
-		`{"payload":{"model":"glm-5:cloud"}}` + "\n"
-	if err := os.WriteFile(otherSessionPath, []byte(otherData), 0o644); err != nil {
-		t.Fatalf("WriteFile other: %v", err)
-	}
-
+// TestCodexRightExitsTUIWithForceConfigure verifies that pressing right arrow
+// on the Codex menu item exits the TUI with ForceConfigure=true, which triggers
+// the two-level model+session picker via DefaultCodexPicker.
+func TestCodexRightExitsTUIWithForceConfigure(t *testing.T) {
 	state := launcherTestState()
 	codex := state.Integrations["codex"]
 	codex.CurrentModel = "qwen3:8b"
@@ -228,46 +195,23 @@ func TestCodexRightOpensSessionPicker(t *testing.T) {
 	updated, _ := menu.Update(tea.KeyMsg{Type: tea.KeyRight})
 	got := updated.(model)
 
-	if !got.showingSessionModal {
-		t.Fatal("expected showingSessionModal=true after right on codex")
+	// Right arrow on Codex should exit the TUI with ForceConfigure=true.
+	if !got.quitting {
+		t.Fatal("expected quitting=true after right on codex")
 	}
-	// Both the Ollama session and the cross-provider OpenAI session should now
-	// appear in the picker (2 items total). The OpenAI session is placed after
-	// the Ollama session in the "Other Sessions (cross-provider)" section.
-	if len(got.sessionSelector.items) != 2 {
-		t.Fatalf("len(sessionSelector.items) = %d, want 2 (ollama + cross-provider session)", len(got.sessionSelector.items))
+	if !got.selected {
+		t.Fatal("expected selected=true after right on codex")
 	}
-	if got.sessionSelector.items[0].Value != "session-123" {
-		t.Fatalf("session value = %q, want session-123", got.sessionSelector.items[0].Value)
+	if !got.action.ForceConfigure {
+		t.Fatal("expected action.ForceConfigure=true after right on codex")
 	}
-	if !got.sessionSelector.items[0].Recommended {
-		t.Fatal("expected matching-model session to be pinned as recommended")
+	if got.action.Integration != "codex" {
+		t.Fatalf("action.Integration = %q, want codex", got.action.Integration)
 	}
-	if !strings.Contains(got.sessionSelector.items[0].Description, "qwen3:8b") {
-		t.Fatalf("session description = %q, want model metadata", got.sessionSelector.items[0].Description)
+	// The inline session modal should NOT be shown.
+	if got.showingSessionModal {
+		t.Fatal("expected showingSessionModal=false: session picker is now handled by DefaultCodexPicker")
 	}
-	if got.sessionSelector.recommendedHeader != "Matching Model" {
-		t.Fatalf("recommendedHeader = %q, want Matching Model", got.sessionSelector.recommendedHeader)
-	}
-	if got.sessionSelector.otherHeader != "Other Sessions (cross-provider)" {
-		t.Fatalf("otherHeader = %q, want \"Other Sessions (cross-provider)\"", got.sessionSelector.otherHeader)
-	}
-	// The second item should be the cross-provider OpenAI session.
-	if got.sessionSelector.items[1].Value != "session-999" {
-		t.Fatalf("items[1].Value = %q, want session-999 (cross-provider session)", got.sessionSelector.items[1].Value)
-	}
-	if got.sessionSelector.items[1].Recommended {
-		t.Fatal("cross-provider session should not be marked as recommended")
-	}
-	// The cross-provider session description should contain the original provider
-	// and a note that the local model will be used on resume.
-	if !strings.Contains(got.sessionSelector.items[1].Description, "originally openai") {
-		t.Fatalf("cross-provider description = %q, want 'originally openai'", got.sessionSelector.items[1].Description)
-	}
-	if !strings.Contains(got.sessionSelector.items[1].Description, "will use qwen3:8b") {
-		t.Fatalf("cross-provider description = %q, want 'will use qwen3:8b'", got.sessionSelector.items[1].Description)
-	}
-	_ = cwd // used in session data
 }
 
 func TestCodexSessionPickerEnterSelectsSession(t *testing.T) {
