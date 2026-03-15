@@ -21,6 +21,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -53,13 +54,41 @@ func openAIProxyBaseURL() string {
 }
 
 // openAIAPIKey returns the API key to use when proxying to OpenAI.
-// It prefers OPENAI_API_KEY and falls back to an empty string (which will
-// cause OpenAI to return a 401, surfaced cleanly to the caller).
+// Priority order:
+//  1. OPENAI_API_KEY environment variable
+//  2. Key stored in ~/.codex/auth.json (written by `ollama openai login`)
+//
+// Returns an empty string when no key is available, which will cause the
+// upstream to return a 401 that is surfaced cleanly to the caller.
 func openAIAPIKey() string {
 	if v := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); v != "" {
 		return v
 	}
+	if v := loadStoredOpenAIAPIKey(); v != "" {
+		return v
+	}
 	return ""
+}
+
+// loadStoredOpenAIAPIKey reads the OPENAI_API_KEY field from
+// ~/.codex/auth.json.  Errors are silently ignored so the proxy never fails
+// to start due to a missing or malformed credentials file.
+func loadStoredOpenAIAPIKey() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(home + "/.codex/auth.json")
+	if err != nil {
+		return ""
+	}
+	var auth struct {
+		OpenAIAPIKey string `json:"OPENAI_API_KEY"`
+	}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.OpenAIAPIKey)
 }
 
 // isModelLocalOrCloud returns true when the model name refers to a locally

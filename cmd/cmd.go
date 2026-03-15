@@ -2320,6 +2320,65 @@ func NewCLI() *cobra.Command {
 		}
 	}
 
+	// ── openai subcommand ────────────────────────────────────────────────────
+	openaiCmd := &cobra.Command{
+		Use:   "openai",
+		Short: "Manage OpenAI authentication",
+		Long: `Manage OpenAI credentials stored in ~/.codex/auth.json.
+
+These credentials are shared with the native Codex CLI and are used by
+Ollama's OpenAI passthrough proxy when OPENAI_API_KEY is not set in the
+environment.`,
+	}
+
+	openaiLoginCmd := &cobra.Command{
+		Use:   "login",
+		Short: "Sign in to OpenAI (browser flow or --api-key)",
+		Long: `Sign in to OpenAI using the same browser-based OAuth 2.0 + PKCE flow as the
+native Codex CLI, or store an API key directly with --api-key.
+
+Credentials are saved to ~/.codex/auth.json and are automatically used by
+Ollama's OpenAI passthrough proxy.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			apiKeyFlag, _ := cmd.Flags().GetString("api-key")
+			if apiKeyFlag != "" {
+				return launch.SaveOpenAIAPIKey(apiKeyFlag)
+			}
+			return launch.LoginOpenAI(cmd.Context())
+		},
+	}
+	openaiLoginCmd.Flags().String("api-key", "", "Store an OpenAI API key directly (skips browser flow)")
+
+	openaiLogoutCmd := &cobra.Command{
+		Use:   "logout",
+		Short: "Sign out of OpenAI and remove stored credentials",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := launch.LogoutOpenAI(); err != nil {
+				return err
+			}
+			fmt.Println("Signed out of OpenAI.")
+			return nil
+		},
+	}
+
+	openaiWhoamiCmd := &cobra.Command{
+		Use:   "whoami",
+		Short: "Show the currently authenticated OpenAI account",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			info, err := launch.WhoamiOpenAI()
+			if err != nil {
+				return err
+			}
+			fmt.Println(info)
+			return nil
+		},
+	}
+
+	openaiCmd.AddCommand(openaiLoginCmd, openaiLogoutCmd, openaiWhoamiCmd)
+
 	rootCmd.AddCommand(
 		serveCmd,
 		createCmd,
@@ -2338,6 +2397,7 @@ func NewCLI() *cobra.Command {
 		deleteCmd,
 		runnerCmd,
 		launch.LaunchCmd(checkServerHeartbeat, runInteractiveTUI),
+		openaiCmd,
 	)
 
 	return rootCmd
