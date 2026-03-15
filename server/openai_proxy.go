@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/ollama/ollama/manifest"
@@ -185,12 +186,158 @@ func openAIPassthroughMiddleware() gin.HandlerFunc {
 // openAIModelsPassthroughMiddleware merges the upstream OpenAI /v1/models list
 // into the local Ollama model list.  It is used on the GET /v1/models route.
 //
-// NOTE: This is a future extension point.  For now the middleware is a no-op
-// pass-through so the route wiring is already in place.
+// When OPENAI_API_KEY (or a stored credential) is available the middleware:
+//  1. Lets the local handler run and captures its response (local models).
+//  2. Fetches the upstream /v1/models list from the OpenAI-compatible API.
+//  3. Merges the two lists, deduplicating by model ID.
+//  4. Writes the merged list back to the client.
+//
+// If no API key is configured the middleware is a transparent pass-through so
+// only local models are returned.
 func openAIModelsPassthroughMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		apiKey := openAIAPIKey()
+		if apiKey == "" {
+			// No upstream key — serve only local models.
+			c.Next()
+			return
+		}
+
+		// Intercept the response written by the downstream handler so we can
+		// merge the upstream model list into it.
+		bw := &modelsBufferedWriter{ResponseWriter: c.Writer}
+		c.Writer = bw
 		c.Next()
+		c.Writer = bw.ResponseWriter // restore the original gin.ResponseWriter
+
+		// Only merge on a successful local response.
+		if bw.status != 0 && bw.status != http.StatusOK {
+			// Write the original (error) response unchanged.
+			c.Writer.WriteHeader(bw.status)
+			_, _ = c.Writer.Write(bw.body)
+			return
+		}
+
+		// Parse the local model list.
+		var local openaiListCompletion
+		if err := json.Unmarshal(bw.body, &local); err != nil {
+			// Cannot parse — return the original response unchanged.
+			if bw.status != 0 {
+				c.Writer.WriteHeader(bw.status)
+			}
+			_, _ = c.Writer.Write(bw.body)
+			return
+		}
+
+		// Fetch the upstream model list with a short timeout.
+		upstreamModels := fetchOpenAIModels(c.Request.Context(), apiKey)
+
+		// Merge: start with local models, then append upstream models that are
+		// not already present locally (deduplicate by ID).
+		merged := local.Data
+		localIDs := make(map[string]struct{}, len(merged))
+		for _, m := range merged {
+			localIDs[m.ID] = struct{}{}
+		}
+		for _, m := range upstreamModels {
+			if _, exists := localIDs[m.ID]; !exists {
+				merged = append(merged, m)
+			}
+		}
+
+		result := openaiListCompletion{Object: "list", Data: merged}
+		data, err := json.Marshal(result)
+		if err != nil {
+			// Fallback to original response on marshal error.
+			if bw.status != 0 {
+				c.Writer.WriteHeader(bw.status)
+			}
+			_, _ = c.Writer.Write(bw.body)
+			return
+		}
+
+		c.Writer.Header().Set("Content-Type", "application/json")
+		c.Writer.WriteHeader(http.StatusOK)
+		_, _ = c.Writer.Write(data)
 	}
+}
+
+// openaiModelEntry is a minimal OpenAI-compatible model object used for
+// merging the upstream model list with local Ollama models.
+type openaiModelEntry struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// openaiListCompletion is the OpenAI /v1/models response envelope.
+type openaiListCompletion struct {
+	Object string             `json:"object"`
+	Data   []openaiModelEntry `json:"data"`
+}
+
+// modelsBufferedWriter captures the response written by a downstream handler
+// so the middleware can inspect and modify it before sending to the client.
+// It embeds gin.ResponseWriter so it satisfies the full gin.ResponseWriter
+// interface while overriding only WriteHeader and Write.
+type modelsBufferedWriter struct {
+	gin.ResponseWriter
+	body   []byte
+	status int
+}
+
+func (w *modelsBufferedWriter) WriteHeader(code int) {
+	w.status = code
+}
+
+func (w *modelsBufferedWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	w.body = append(w.body, b...)
+	return len(b), nil
+}
+
+// fetchOpenAIModels fetches the model list from the upstream OpenAI-compatible
+// API.  Returns an empty slice on any error so the caller can still serve the
+// local model list.
+func fetchOpenAIModels(ctx context.Context, apiKey string) []openaiModelEntry {
+	baseURL := openAIProxyBaseURL()
+	targetURL := strings.TrimRight(baseURL, "/") + "/models"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		slog.Debug("openai proxy: failed to build models request", "error", err)
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if org := strings.TrimSpace(os.Getenv("OPENAI_ORG_ID")); org != "" {
+		req.Header.Set("OpenAI-Organization", org)
+	}
+	if proj := strings.TrimSpace(os.Getenv("OPENAI_PROJECT_ID")); proj != "" {
+		req.Header.Set("OpenAI-Project", proj)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.Debug("openai proxy: models fetch failed", "error", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		slog.Debug("openai proxy: models fetch returned non-200", "status", resp.StatusCode)
+		return nil
+	}
+
+	var result openaiListCompletion
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		slog.Debug("openai proxy: failed to decode models response", "error", err)
+		return nil
+	}
+	return result.Data
 }
 
 // proxyToOpenAI forwards the current request to the upstream OpenAI API and

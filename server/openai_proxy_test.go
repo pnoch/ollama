@@ -283,10 +283,11 @@ func TestOpenAIPassthroughMiddleware_PathStripping(t *testing.T) {
 	_ = rec
 }
 
-// TestOpenAIModelsPassthroughMiddleware_Passthrough verifies that the models
-// middleware always calls Next (it is currently a no-op pass-through).
-func TestOpenAIModelsPassthroughMiddleware_Passthrough(t *testing.T) {
+// TestOpenAIModelsPassthroughMiddleware_NoKey verifies that when no API key is
+// configured the middleware is a transparent pass-through (local models only).
+func TestOpenAIModelsPassthroughMiddleware_NoKey(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	t.Setenv("OPENAI_API_KEY", "")
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	rec := httptest.NewRecorder()
@@ -300,6 +301,104 @@ func TestOpenAIModelsPassthroughMiddleware_Passthrough(t *testing.T) {
 	r.ServeHTTP(rec, req)
 
 	if !nextCalled {
-		t.Fatal("expected openAIModelsPassthroughMiddleware to call Next")
+		t.Fatal("expected openAIModelsPassthroughMiddleware to call Next when no API key is set")
+	}
+}
+
+// TestOpenAIModelsPassthroughMiddleware_MergesUpstream verifies that when an
+// API key is configured the middleware merges the upstream model list into the
+// local model list, deduplicating by ID.
+func TestOpenAIModelsPassthroughMiddleware_MergesUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Upstream server returns two models: one that overlaps with local and one new.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"local-model","object":"model","created":1000,"owned_by":"ollama"},{"id":"gpt-4o","object":"model","created":2000,"owned_by":"openai"}]}`)
+	}))
+	defer upstream.Close()
+
+	t.Setenv("OPENAI_API_KEY", "sk-test")
+	t.Setenv("OLLAMA_OPENAI_PROXY_BASE_URL", upstream.URL+"/v1")
+
+	// Local handler returns one model.
+	localResp := `{"object":"list","data":[{"id":"local-model","object":"model","created":500,"owned_by":"ollama"}]}`
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	r := gin.New()
+	r.GET("/v1/models", openAIModelsPassthroughMiddleware(), func(c *gin.Context) {
+		c.Header("Content-Type", "application/json")
+		c.String(http.StatusOK, localResp)
+	})
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	var result openaiListCompletion
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Should have 2 models: local-model (from local, deduplicated) and gpt-4o (from upstream).
+	if len(result.Data) != 2 {
+		t.Fatalf("expected 2 models in merged list, got %d: %+v", len(result.Data), result.Data)
+	}
+
+	ids := make(map[string]bool)
+	for _, m := range result.Data {
+		ids[m.ID] = true
+	}
+	if !ids["local-model"] {
+		t.Error("expected local-model in merged list")
+	}
+	if !ids["gpt-4o"] {
+		t.Error("expected gpt-4o in merged list")
+	}
+}
+
+// TestOpenAIModelsPassthroughMiddleware_UpstreamError verifies that when the
+// upstream fetch fails the middleware still returns the local model list.
+func TestOpenAIModelsPassthroughMiddleware_UpstreamError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Upstream server returns a 500 error.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	t.Setenv("OPENAI_API_KEY", "sk-test")
+	t.Setenv("OLLAMA_OPENAI_PROXY_BASE_URL", upstream.URL+"/v1")
+
+	localResp := `{"object":"list","data":[{"id":"local-model","object":"model","created":500,"owned_by":"ollama"}]}`
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	r := gin.New()
+	r.GET("/v1/models", openAIModelsPassthroughMiddleware(), func(c *gin.Context) {
+		c.Header("Content-Type", "application/json")
+		c.String(http.StatusOK, localResp)
+	})
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	var result openaiListCompletion
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Should have only the local model when upstream fails.
+	if len(result.Data) != 1 {
+		t.Fatalf("expected 1 model when upstream fails, got %d: %+v", len(result.Data), result.Data)
+	}
+	if result.Data[0].ID != "local-model" {
+		t.Errorf("expected local-model, got %q", result.Data[0].ID)
 	}
 }
