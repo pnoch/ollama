@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -606,6 +607,80 @@ func TestOpenAIPassthroughMiddleware_OAuthJWTPriorityOverAPIKey(t *testing.T) {
 		t.Fatalf("expected 200 from upstream, got %d: %s", rec.Code, rec.Body.String())
 	}
 	// The request must have been sent with the JWT, not the API key.
+	wantAuth := "Bearer " + fakeJWT
+	if receivedAuth != wantAuth {
+		t.Fatalf("expected Authorization %q, got %q", wantAuth, receivedAuth)
+	}
+}
+
+// TestOpenAIAPIKey_SkipsDummyOllamaKey verifies that when OPENAI_API_KEY is
+// set to the dummy "ollama" placeholder (injected by `ollama codex` launch
+// logic), openAIAPIKey() skips it and falls through to loadStoredOpenAIAPIKey.
+func TestOpenAIAPIKey_SkipsDummyOllamaKey(t *testing.T) {
+	// With OPENAI_API_KEY=ollama the function should return "" (no stored key).
+	t.Setenv("OPENAI_API_KEY", "ollama")
+	if got := openAIAPIKey(); got != "" {
+		t.Fatalf("expected empty key when OPENAI_API_KEY=ollama, got %q", got)
+	}
+}
+
+// TestOpenAIPassthroughMiddleware_OllamaKeyFallsBackToStoredOAuth verifies
+// that when OPENAI_API_KEY=ollama (the dummy placeholder) and a ChatGPT OAuth
+// token is stored in auth.json, the middleware proxies the request to the
+// ChatGPT backend using the OAuth token — not to api.openai.com.
+func TestOpenAIPassthroughMiddleware_OllamaKeyFallsBackToStoredOAuth(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Fake ChatGPT OAuth JWT.
+	fakeJWT := "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIn0.fakesig"
+
+	var receivedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"resp-1"}`))
+	}))
+	defer upstream.Close()
+
+	// Simulate the `ollama codex` launch: OPENAI_API_KEY=ollama (dummy).
+	t.Setenv("OPENAI_API_KEY", "ollama")
+	// Point the ChatGPT codex base URL to our mock upstream.
+	t.Setenv("OLLAMA_CHATGPT_CODEX_BASE_URL", upstream.URL)
+
+	// Write a temporary auth.json with an OAuth access_token.
+	home := t.TempDir()
+	authJSON := `{"tokens":{"id_token":"eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ.sig","access_token":"` + fakeJWT + `","refresh_token":"rt"}}`
+	if err := os.WriteFile(home+"/.codex/auth.json", []byte(authJSON), 0o600); err != nil {
+		// Create the directory first.
+		if err2 := os.MkdirAll(home+"/.codex", 0o700); err2 != nil {
+			t.Fatalf("mkdir: %v", err2)
+		}
+		if err2 := os.WriteFile(home+"/.codex/auth.json", []byte(authJSON), 0o600); err2 != nil {
+			t.Fatalf("write auth.json: %v", err2)
+		}
+	}
+	t.Setenv("HOME", home)
+
+	router := gin.New()
+	router.POST("/v1/responses", openAIPassthroughMiddleware(), func(c *gin.Context) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "model not found locally"})
+	})
+
+	body := `{"model":"gpt-5.4","input":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// Codex sends Authorization: Bearer ollama (the dummy key).
+	req.Header.Set("Authorization", "Bearer ollama")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("proxy did not activate: request fell through to local handler (got 404)")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from upstream, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// The request must have been forwarded with the OAuth JWT, not "ollama".
 	wantAuth := "Bearer " + fakeJWT
 	if receivedAuth != wantAuth {
 		t.Fatalf("expected Authorization %q, got %q", wantAuth, receivedAuth)

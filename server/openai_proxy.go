@@ -62,13 +62,14 @@ func openAIProxyBaseURL() string {
 
 // openAIAPIKey returns the API key to use when proxying to OpenAI.
 // Priority order:
-//  1. OPENAI_API_KEY environment variable
-//  2. Key stored in ~/.codex/auth.json (written by `ollama openai login`)
+//  1. OPENAI_API_KEY environment variable (skipped when set to the dummy
+//     "ollama" placeholder injected by `ollama codex` launch logic)
+//  2. OAuth access_token or OPENAI_API_KEY stored in ~/.codex/auth.json
 //
 // Returns an empty string when no key is available, which will cause the
 // upstream to return a 401 that is surfaced cleanly to the caller.
 func openAIAPIKey() string {
-	if v := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); v != "" && v != "ollama" {
 		return v
 	}
 	if v := loadStoredOpenAIAPIKey(); v != "" {
