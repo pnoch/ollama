@@ -91,11 +91,20 @@ func loadStoredOpenAIAPIKey() string {
 	}
 	var auth struct {
 		OpenAIAPIKey string `json:"OPENAI_API_KEY"`
+		Tokens       *struct {
+			AccessToken string `json:"access_token"`
+		} `json:"tokens"`
 	}
 	if err := json.Unmarshal(data, &auth); err != nil {
 		return ""
 	}
-	return strings.TrimSpace(auth.OpenAIAPIKey)
+	if auth.Tokens != nil && auth.Tokens.AccessToken != "" {
+		return strings.TrimSpace(auth.Tokens.AccessToken)
+	}
+	if auth.OpenAIAPIKey != "" {
+		return strings.TrimSpace(auth.OpenAIAPIKey)
+	}
+	return ""
 }
 
 // isModelLocalOrCloud returns true when the model name refers to a locally
