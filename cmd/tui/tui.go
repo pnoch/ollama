@@ -321,14 +321,29 @@ func (m *model) openCodexSessionModal(selectedModel string) {
 		} else {
 			// Cross-provider sessions are shown globally and are never pinned
 			// as "recommended" since the model name won't match the local one.
+			// We annotate the name with the original provider so the user knows
+			// this session came from a different provider and will be resumed
+			// with the currently selected local model.
 			name := session.Title
 			if session.Model != "" {
 				name = fmt.Sprintf("%s  [%s]", name, session.Model)
 			}
+			// Build a description that includes the original provider and a
+			// note that the local model will be used on resume.
+			desc := session.Description
+			providerNote := fmt.Sprintf("originally %s", session.Provider)
+			if selectedModel != "" {
+				providerNote = fmt.Sprintf("originally %s • will use %s", session.Provider, selectedModel)
+			}
+			if desc != "" {
+				desc = desc + "  (" + providerNote + ")"
+			} else {
+				desc = providerNote
+			}
 			otherItems = append(otherItems, SelectItem{
 				Name:        name,
 				Value:       session.ID,
-				Description: session.Description,
+				Description: desc,
 				Recommended: false,
 			})
 		}

@@ -259,6 +259,14 @@ func TestCodexRightOpensSessionPicker(t *testing.T) {
 	if got.sessionSelector.items[1].Recommended {
 		t.Fatal("cross-provider session should not be marked as recommended")
 	}
+	// The cross-provider session description should contain the original provider
+	// and a note that the local model will be used on resume.
+	if !strings.Contains(got.sessionSelector.items[1].Description, "originally openai") {
+		t.Fatalf("cross-provider description = %q, want 'originally openai'", got.sessionSelector.items[1].Description)
+	}
+	if !strings.Contains(got.sessionSelector.items[1].Description, "will use qwen3:8b") {
+		t.Fatalf("cross-provider description = %q, want 'will use qwen3:8b'", got.sessionSelector.items[1].Description)
+	}
 	_ = cwd // used in session data
 }
 

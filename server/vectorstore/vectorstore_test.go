@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ollama/ollama/server/vectorstore"
 )
@@ -294,5 +295,51 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 	// Verify the DB file actually exists on disk.
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Errorf("DB file not found: %v", err)
+	}
+}
+
+// ─── TTL eviction ─────────────────────────────────────────────────────────────
+
+func TestEvictOlderThan(t *testing.T) {
+	s := openTestStore(t)
+
+	// Create two vector stores.
+	old, err := s.CreateVectorStore("old-store", nil)
+	if err != nil {
+		t.Fatalf("CreateVectorStore old: %v", err)
+	}
+	recent, err := s.CreateVectorStore("recent-store", nil)
+	if err != nil {
+		t.Fatalf("CreateVectorStore recent: %v", err)
+	}
+
+	// Evict with a cutoff strictly before both stores were created — nothing deleted.
+	// old.CreatedAt is a Unix timestamp (int64); subtract 1 second.
+	cutoffBefore := time.Unix(old.CreatedAt-1, 0)
+	n, err := s.EvictOlderThan(cutoffBefore)
+	if err != nil {
+		t.Fatalf("EvictOlderThan (before): %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 evictions with past cutoff, got %d", n)
+	}
+
+	// Evict with a cutoff 1 second after the most recent store — both deleted.
+	cutoffAfter := time.Unix(recent.CreatedAt+1, 0)
+	n, err = s.EvictOlderThan(cutoffAfter)
+	if err != nil {
+		t.Fatalf("EvictOlderThan (after): %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expected 2 evictions, got %d", n)
+	}
+
+	// Confirm both stores are gone.
+	stores, err := s.ListVectorStores()
+	if err != nil {
+		t.Fatalf("ListVectorStores: %v", err)
+	}
+	if len(stores) != 0 {
+		t.Errorf("expected 0 stores after eviction, got %d", len(stores))
 	}
 }

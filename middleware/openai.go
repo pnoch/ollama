@@ -859,9 +859,31 @@ func (w *ResponsesWebSearchWriter) Write(data []byte) (int, error) {
 	return w.runLoop(chatResponse, wsCall)
 }
 
+// webSearchCitationInstruction is appended to the last system/developer message
+// (or prepended as a new system message) in the web search follow-up call.
+// It instructs the model to include source URLs verbatim so that
+// ExtractWebSearchCitations can match them and produce url_citation annotations.
+const webSearchCitationInstruction = `When you reference information from the search results, include the source URL verbatim somewhere in your response text (e.g. "According to https://example.com/page, ..."). This allows citations to be linked automatically.`
+
+// injectCitationInstruction appends webSearchCitationInstruction to the last
+// system or developer message in msgs, or prepends a new system message if
+// none exists. It returns the (possibly modified) slice.
+func injectCitationInstruction(msgs []api.Message) []api.Message {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "system" || msgs[i].Role == "developer" {
+			msgs[i].Content = strings.TrimRight(msgs[i].Content, " \n") + "\n\n" + webSearchCitationInstruction
+			return msgs
+		}
+	}
+	return append([]api.Message{{Role: "system", Content: webSearchCitationInstruction}}, msgs...)
+}
+
 func (w *ResponsesWebSearchWriter) runLoop(initialResp api.ChatResponse, initialCall api.ToolCall) (int, error) {
 	followUpMessages := make([]api.Message, 0, len(w.chatReq.Messages)+maxResponsesWebSearchLoops*2)
 	followUpMessages = append(followUpMessages, w.chatReq.Messages...)
+	// Inject a citation instruction so the model includes source URLs verbatim.
+	// This dramatically increases the hit rate of ExtractWebSearchCitations.
+	followUpMessages = injectCitationInstruction(followUpMessages)
 	followUpTools := append(api.Tools(nil), w.chatReq.Tools...)
 
 	currentResp := initialResp

@@ -211,6 +211,9 @@ var (
 	EnableVulkan = Bool("OLLAMA_VULKAN")
 	// NoCloudEnv checks the OLLAMA_NO_CLOUD environment variable.
 	NoCloudEnv = Bool("OLLAMA_NO_CLOUD")
+	// VectorStoreTTLDays sets the number of days after which vector stores are
+	// automatically evicted. 0 disables eviction (default).
+	VectorStoreTTLDays = Uint("OLLAMA_VECTORSTORE_TTL_DAYS", 0)
 )
 
 func String(s string) func() string {

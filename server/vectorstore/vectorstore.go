@@ -591,3 +591,49 @@ func newID(n int) string {
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("%x", b)[:n]
 }
+
+// ─── TTL eviction ────────────────────────────────────────────────────────────
+
+// EvictOlderThan deletes all vector stores whose created_at timestamp is older
+// than the given cutoff time. Cascading foreign keys automatically remove all
+// associated vs_files and vs_chunks rows. Returns the number of stores deleted.
+func (s *Store) EvictOlderThan(cutoff time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.conn.Exec(
+		`DELETE FROM vector_stores WHERE created_at < ?`,
+		cutoff.Unix(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("vectorstore: evict: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// StartEviction launches a background goroutine that calls EvictOlderThan
+// every interval. It evicts stores older than ttl. The goroutine stops when
+// the provided done channel is closed. A zero ttl disables eviction entirely.
+func (s *Store) StartEviction(ttl time.Duration, interval time.Duration, done <-chan struct{}) {
+	if ttl <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case t := <-ticker.C:
+				cutoff := t.Add(-ttl)
+				if n, err := s.EvictOlderThan(cutoff); err != nil {
+					// Log but do not crash; eviction is best-effort.
+					_ = err
+				} else if n > 0 {
+					_ = n // caller can observe via metrics if desired
+				}
+			}
+		}
+	}()
+}

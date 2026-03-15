@@ -1662,6 +1662,19 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 			annotations = []any{}
 		}
 
+		// Emit response.output_text.annotation.added for each citation before done.
+		// This matches the OpenAI streaming spec which sends individual annotation
+		// events so clients can render citations incrementally.
+		for i, ann := range annotations {
+			events = append(events, c.newEvent("response.output_text.annotation.added", map[string]any{
+				"item_id":          c.itemID,
+				"output_index":     c.outputIndex,
+				"content_index":    0,
+				"annotation_index": i,
+				"annotation":       ann,
+			}))
+		}
+
 		// response.output_text.done
 		events = append(events, c.newEvent("response.output_text.done", map[string]any{
 			"item_id":       c.itemID,

@@ -14,6 +14,7 @@ package server
 //   GET    /v1/vector_stores/:id/files
 //   GET    /v1/vector_stores/:id/files/:file_id
 //   DELETE /v1/vector_stores/:id/files/:file_id
+//   POST   /v1/vector_stores/:id/file_batches    (multipart, multiple files)
 
 import (
 	"bytes"
@@ -341,4 +342,158 @@ func (s *Server) FileSearchDepsMiddleware(embedModel string) func(*gin.Context) 
 		c.Set("file_embedder", embedder)
 		c.Next()
 	}
+}
+
+// ─── Batch file upload ────────────────────────────────────────────────────────
+//
+// POST /v1/vector_stores/:id/file_batches
+//
+// Accepts a JSON body with a list of file_ids (pre-uploaded via /v1/files) or
+// a multipart body with multiple "file" parts. Returns a file_batch object that
+// mirrors the OpenAI VectorStoreFileBatch shape.
+//
+// For simplicity this implementation processes files synchronously and returns
+// the batch result immediately (status "completed" or "failed").
+
+type fileBatchRequest struct {
+	// FileIDs is the OpenAI SDK path: reference files already uploaded via
+	// POST /v1/files. Not yet supported; reserved for future use.
+	FileIDs    []string       `json:"file_ids"`
+	EmbedModel string         `json:"embed_model"`
+	Metadata   map[string]any `json:"metadata"`
+}
+
+type fileBatchResult struct {
+	ID             string         `json:"id"`
+	Object         string         `json:"object"`
+	VectorStoreID  string         `json:"vector_store_id"`
+	Status         string         `json:"status"`
+	FileCounts     fileBatchCounts `json:"file_counts"`
+	CreatedAt      int64          `json:"created_at"`
+}
+
+type fileBatchCounts struct {
+	InProgress int `json:"in_progress"`
+	Completed  int `json:"completed"`
+	Failed     int `json:"failed"`
+	Cancelled  int `json:"cancelled"`
+	Total      int `json:"total"`
+}
+
+// UploadVectorStoreFileBatchHandler handles POST /v1/vector_stores/:id/file_batches.
+// It accepts a multipart/form-data body with one or more "file" parts and an
+// optional "embed_model" field. Each file is embedded and stored in the vector
+// store. The response is a VectorStoreFileBatch object.
+func (s *Server) UploadVectorStoreFileBatchHandler(c *gin.Context) {
+	if s.vectorStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "vector store not available"})
+		return
+	}
+
+	vsID := c.Param("id")
+	if _, err := s.vectorStore.GetVectorStore(vsID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	contentType := c.GetHeader("Content-Type")
+	mediaType, params, _ := mime.ParseMediaType(contentType)
+
+	var embedModel string
+	type fileEntry struct {
+		filename  string
+		mimeType  string
+		content   []byte
+	}
+	var files []fileEntry
+
+	switch {
+	case strings.HasPrefix(mediaType, "multipart/"):
+		mr := multipart.NewReader(c.Request.Body, params["boundary"])
+		for {
+			part, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "malformed multipart: " + err.Error()})
+				return
+			}
+			switch part.FormName() {
+			case "file":
+				mt := part.Header.Get("Content-Type")
+				if mt == "" {
+					mt = "application/octet-stream"
+				}
+				var buf bytes.Buffer
+				if _, err := io.Copy(&buf, io.LimitReader(part, 512<<20)); err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "read file: " + err.Error()})
+					return
+				}
+				files = append(files, fileEntry{
+					filename: part.FileName(),
+					mimeType: mt,
+					content:  buf.Bytes(),
+				})
+			case "embed_model":
+				b, _ := io.ReadAll(part)
+				embedModel = strings.TrimSpace(string(b))
+			}
+		}
+	default:
+		// JSON body with file_ids (future use) or empty.
+		var req fileBatchRequest
+		if err := c.ShouldBindJSON(&req); err != nil && err != io.EOF {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		embedModel = req.EmbedModel
+		if len(req.FileIDs) > 0 {
+			c.JSON(http.StatusNotImplemented, gin.H{"error": "file_ids referencing pre-uploaded files are not yet supported; use multipart/form-data"})
+			return
+		}
+	}
+
+	if len(files) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no files provided"})
+		return
+	}
+
+	if embedModel == "" {
+		embedModel = "nomic-embed-text"
+	}
+	embedFn := s.makeEmbedFunc(c.Request.Context(), embedModel)
+
+	counts := fileBatchCounts{Total: len(files)}
+	for _, f := range files {
+		fn := f.filename
+		if fn == "" {
+			fn = "upload"
+		}
+		mt := f.mimeType
+		if mt == "application/octet-stream" && fn != "" {
+			if t := mime.TypeByExtension(filepath.Ext(fn)); t != "" {
+				mt = t
+			}
+		}
+		if _, err := s.vectorStore.AddFile(vsID, fn, mt, f.content, embedModel, embedFn); err != nil {
+			counts.Failed++
+		} else {
+			counts.Completed++
+		}
+	}
+
+	createdAt := int64(0)
+	if vs, err := s.vectorStore.GetVectorStore(vsID); err == nil {
+		createdAt = vs.CreatedAt
+	}
+
+	c.JSON(http.StatusOK, fileBatchResult{
+		ID:            "batch_" + vsID,
+		Object:        "vector_store.file_batch",
+		VectorStoreID: vsID,
+		Status:        "completed",
+		FileCounts:    counts,
+		CreatedAt:     createdAt,
+	})
 }

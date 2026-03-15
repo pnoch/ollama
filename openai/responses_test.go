@@ -2427,3 +2427,64 @@ if ann.URL != "https://example.com" {
 t.Errorf("annotation URL = %q, want https://example.com", ann.URL)
 }
 }
+
+func TestProcessCompletion_EmitsAnnotationAddedEvents(t *testing.T) {
+c := NewResponsesStreamConverter("resp_test", "msg_test", "llama3.2", ResponsesRequest{})
+results := []map[string]any{
+{"title": "Example", "url": "https://example.com", "content": "content"},
+{"title": "Other", "url": "https://other.com", "content": "other"},
+}
+c.WebSearchCallEvents("ws_1", "query", results)
+c.contentStarted = true
+	// Text uses numeric citation markers [1] and [2] which ExtractWebSearchCitations matches.
+	c.accumulatedText = "According to [1] and [2], this is true."
+events := c.Process(api.ChatResponse{Done: true})
+
+// Collect all annotation.added events.
+var annEvents []map[string]any
+for _, ev := range events {
+if ev.Event == "response.output_text.annotation.added" {
+if d, ok := ev.Data.(map[string]any); ok {
+annEvents = append(annEvents, d)
+}
+}
+}
+
+if len(annEvents) != 2 {
+t.Fatalf("expected 2 annotation.added events, got %d", len(annEvents))
+}
+
+// Each event must carry annotation_index, item_id, and an annotation.
+for i, ev := range annEvents {
+if ev["annotation_index"] != i {
+t.Errorf("annEvents[%d].annotation_index = %v, want %d", i, ev["annotation_index"], i)
+}
+if ev["item_id"] == "" {
+t.Errorf("annEvents[%d].item_id is empty", i)
+}
+ann, ok := ev["annotation"].(URLCitationAnnotation)
+if !ok {
+t.Fatalf("annEvents[%d].annotation type = %T, want URLCitationAnnotation", i, ev["annotation"])
+}
+if ann.Type != "url_citation" {
+t.Errorf("annEvents[%d].annotation.type = %q, want url_citation", i, ann.Type)
+}
+}
+
+// annotation.added events must appear before output_text.done.
+var annIdx, doneIdx int = -1, -1
+for i, ev := range events {
+if ev.Event == "response.output_text.annotation.added" && annIdx == -1 {
+annIdx = i
+}
+if ev.Event == "response.output_text.done" {
+doneIdx = i
+}
+}
+if annIdx == -1 || doneIdx == -1 {
+t.Fatal("expected both annotation.added and output_text.done events")
+}
+if annIdx >= doneIdx {
+t.Errorf("annotation.added (index %d) must come before output_text.done (index %d)", annIdx, doneIdx)
+}
+}

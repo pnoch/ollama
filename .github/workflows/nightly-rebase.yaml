@@ -1,0 +1,198 @@
+name: nightly-rebase
+
+# Rebase pnoch/ollama:main onto upstream ollama/ollama:main every night.
+# If the rebase succeeds and tests pass, force-push the result.
+# If there are conflicts or test failures, open a GitHub issue.
+
+on:
+  schedule:
+    # 02:00 UTC every day
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (rebase but do not push)"
+        required: false
+        default: "false"
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/ollama/ollama.git
+          git fetch upstream main --no-tags
+
+      - name: Check if rebase is needed
+        id: check
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Commits behind upstream: $BEHIND"
+
+      - name: Rebase onto upstream/main
+        id: rebase
+        if: steps.check.outputs.behind != '0'
+        run: |
+          # Attempt the rebase. On conflict, capture the error and abort.
+          if ! GIT_EDITOR=true git rebase upstream/main; then
+            echo "REBASE_FAILED=true" >> "$GITHUB_ENV"
+            git rebase --abort || true
+            exit 0
+          fi
+          echo "REBASE_FAILED=false" >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        if: env.REBASE_FAILED == 'false' && steps.check.outputs.behind != '0'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        id: tests
+        if: env.REBASE_FAILED == 'false' && steps.check.outputs.behind != '0'
+        run: |
+          if ! go test \
+            ./openai/... \
+            ./middleware/... \
+            ./tools/... \
+            ./cmd/tui/... \
+            ./cmd/launch/... \
+            ./server/vectorstore/... \
+            2>&1 | tee /tmp/test_output.txt; then
+            echo "TESTS_FAILED=true" >> "$GITHUB_ENV"
+          else
+            echo "TESTS_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Force-push rebased branch
+        if: >
+          env.REBASE_FAILED == 'false' &&
+          env.TESTS_FAILED == 'false' &&
+          steps.check.outputs.behind != '0' &&
+          github.event.inputs.dry_run != 'true'
+        run: |
+          git push origin main --force-with-lease
+          echo "Successfully pushed rebased branch."
+
+      - name: Report dry-run result
+        if: >
+          env.REBASE_FAILED == 'false' &&
+          env.TESTS_FAILED == 'false' &&
+          steps.check.outputs.behind != '0' &&
+          github.event.inputs.dry_run == 'true'
+        run: |
+          echo "Dry run: rebase and tests succeeded. Would have force-pushed."
+          git log --oneline upstream/main..HEAD | head -20
+
+      - name: Open issue on rebase conflict
+        if: env.REBASE_FAILED == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `[nightly-rebase] Merge conflict detected — ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## Nightly rebase failed',
+              '',
+              `The automatic rebase of \`pnoch/ollama:main\` onto \`upstream/main\` failed due to merge conflicts.`,
+              '',
+              '**Action required:** Resolve conflicts manually and force-push.',
+              '',
+              '```',
+              'git fetch upstream main',
+              'git rebase upstream/main',
+              '# resolve conflicts',
+              'git push origin main --force-with-lease',
+              '```',
+              '',
+              `Triggered by workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            ].join('\n');
+
+            // Check for an existing open issue to avoid duplicates.
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'nightly-rebase',
+            });
+            const existing = issues.data.find(i => i.title.startsWith('[nightly-rebase] Merge conflict'));
+            if (!existing) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['nightly-rebase'],
+              });
+            }
+
+      - name: Open issue on test failure
+        if: env.TESTS_FAILED == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let output = '';
+            try { output = fs.readFileSync('/tmp/test_output.txt', 'utf8').slice(-3000); } catch {}
+
+            const title = `[nightly-rebase] Test failure after rebase — ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## Nightly rebase: tests failed after successful rebase',
+              '',
+              'The rebase onto upstream succeeded but the test suite failed.',
+              '',
+              '<details><summary>Test output (last 3 KB)</summary>',
+              '',
+              '```',
+              output,
+              '```',
+              '</details>',
+              '',
+              `Triggered by workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            ].join('\n');
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'nightly-rebase',
+            });
+            const existing = issues.data.find(i => i.title.startsWith('[nightly-rebase] Test failure'));
+            if (!existing) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['nightly-rebase'],
+              });
+            }
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Nightly rebase summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commits behind upstream | ${{ steps.check.outputs.behind }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Rebase failed | ${REBASE_FAILED:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tests failed | ${TESTS_FAILED:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dry run | ${{ github.event.inputs.dry_run || 'false' }} |" >> "$GITHUB_STEP_SUMMARY"

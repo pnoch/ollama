@@ -1724,6 +1724,7 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	r.GET("/v1/vector_stores/:id/files", s.ListVectorStoreFilesHandler)
 	r.GET("/v1/vector_stores/:id/files/:file_id", s.GetVectorStoreFileHandler)
 	r.DELETE("/v1/vector_stores/:id/files/:file_id", s.DeleteVectorStoreFileHandler)
+	r.POST("/v1/vector_stores/:id/file_batches", s.UploadVectorStoreFileBatchHandler)
 
 	if rc != nil {
 		// wrap old with new
@@ -1786,6 +1787,18 @@ func Serve(ln net.Listener) error {
 			slog.Warn("vector store unavailable", "error", err)
 		} else {
 			s.vectorStore = vs
+			// Start background TTL eviction if OLLAMA_VECTORSTORE_TTL_DAYS is set.
+			if days := envconfig.VectorStoreTTLDays(); days > 0 {
+				ttl := time.Duration(days) * 24 * time.Hour
+				// Eviction interval: once per hour, or once per TTL if TTL < 1h.
+				evictInterval := time.Hour
+				if ttl < evictInterval {
+					evictInterval = ttl
+				}
+				done := make(chan struct{})
+				vs.StartEviction(ttl, evictInterval, done)
+				slog.Info("vector store TTL eviction enabled", "ttl_days", days)
+			}
 		}
 	}
 	var rc *ollama.Registry
