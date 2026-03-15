@@ -78,34 +78,55 @@ func openAIAPIKey() string {
 	return ""
 }
 
+// storedCredentials holds the API key/token and optional ChatGPT account ID
+// read from ~/.codex/auth.json.
+type storedCredentials struct {
+	APIKey    string
+	AccountID string
+}
+
 // loadStoredOpenAIAPIKey reads the OPENAI_API_KEY field from
 // ~/.codex/auth.json.  Errors are silently ignored so the proxy never fails
 // to start due to a missing or malformed credentials file.
 func loadStoredOpenAIAPIKey() string {
+	return loadStoredCredentials().APIKey
+}
+
+// loadStoredCredentials reads the API key and optional ChatGPT account ID
+// from ~/.codex/auth.json.  Errors are silently ignored.
+//
+// Priority for the API key:
+//  1. OAuth access_token from tokens.access_token
+//  2. OPENAI_API_KEY field
+func loadStoredCredentials() storedCredentials {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ""
+		return storedCredentials{}
 	}
 	data, err := os.ReadFile(home + "/.codex/auth.json")
 	if err != nil {
-		return ""
+		return storedCredentials{}
 	}
 	var auth struct {
-		OpenAIAPIKey string `json:"OPENAI_API_KEY"`
+		OpenAIAPIKey string `json:"openai_api_key"`
 		Tokens       *struct {
 			AccessToken string `json:"access_token"`
+			AccountID   string `json:"account_id"`
 		} `json:"tokens"`
 	}
 	if err := json.Unmarshal(data, &auth); err != nil {
-		return ""
+		return storedCredentials{}
 	}
 	if auth.Tokens != nil && auth.Tokens.AccessToken != "" {
-		return strings.TrimSpace(auth.Tokens.AccessToken)
+		return storedCredentials{
+			APIKey:    strings.TrimSpace(auth.Tokens.AccessToken),
+			AccountID: strings.TrimSpace(auth.Tokens.AccountID),
+		}
 	}
 	if auth.OpenAIAPIKey != "" {
-		return strings.TrimSpace(auth.OpenAIAPIKey)
+		return storedCredentials{APIKey: strings.TrimSpace(auth.OpenAIAPIKey)}
 	}
-	return ""
+	return storedCredentials{}
 }
 
 // isModelLocalOrCloud returns true when the model name refers to a locally
@@ -483,9 +504,35 @@ func proxyToOpenAI(c *gin.Context, body []byte, apiKey string) {
 
 	// Copy safe request headers from the incoming request.
 	copyProxyRequestHeaders(outReq.Header, c.Request.Header)
-
 	// Override / set the Authorization header with the real OpenAI key.
 	outReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	// When proxying to chatgpt.com, inject the ChatGPT-Account-ID header
+	// from auth.json if available.  Codex normally sends this header but
+	// the gpt-oss provider (used when OPENAI_BASE_URL is set to localhost)
+	// does not add it — causing a 403 from the chatgpt.com WAF.
+	if isChatGPTOAuthToken(apiKey) {
+		creds := loadStoredCredentials()
+		if creds.AccountID != "" && outReq.Header.Get("ChatGPT-Account-ID") == "" {
+			outReq.Header.Set("ChatGPT-Account-ID", creds.AccountID)
+			slog.Info("openai proxy: injected ChatGPT-Account-ID",
+				"account_id", creds.AccountID,
+			)
+		}
+	}
+
+	// Log all outgoing headers for debugging.
+	{
+		var headerPairs []any
+		for k, vs := range outReq.Header {
+			if strings.EqualFold(k, "Authorization") {
+				headerPairs = append(headerPairs, k, safePrefix(strings.Join(vs, ","), 12)+"...")
+			} else {
+				headerPairs = append(headerPairs, k, strings.Join(vs, ","))
+			}
+		}
+		slog.Info("openai proxy: outgoing headers", headerPairs...)
+	}
 
 	// Forward optional organisation and project headers.
 	if org := strings.TrimSpace(os.Getenv("OPENAI_ORG_ID")); org != "" {
