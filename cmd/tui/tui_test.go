@@ -190,6 +190,15 @@ func TestCodexRightOpensSessionPicker(t *testing.T) {
 		t.Fatalf("MkdirAll: %v", err)
 	}
 	cwd := t.TempDir()
+	// Change to cwd so that os.Getwd() in openCodexSessionModal matches the session's cwd.
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
 	data := `{"payload":{"id":"session-123","timestamp":"2026-03-10T12:00:00Z","cwd":"` + cwd + `","model_provider":"ollama","git":{"branch":"main","repository_url":"https://github.com/acme/ollama.git"}}}` + "\n" +
 		`{"payload":{"model":"qwen3:8b"}}` + "\n" +
 		`{"payload":{"type":"user_message","message":"Fix the bug."}}` + "\n"

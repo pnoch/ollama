@@ -18,11 +18,11 @@ func TestCodexArgs(t *testing.T) {
 		args  []string
 		want  []string
 	}{
-		{"with model", "llama3.2", nil, []string{"--oss", "-m", "llama3.2"}},
-		{"empty model", "", nil, []string{"--oss"}},
-		{"with model and profile", "qwen3.5", []string{"-p", "myprofile"}, []string{"--oss", "-m", "qwen3.5", "-p", "myprofile"}},
-		{"with sandbox flag", "llama3.2", []string{"--sandbox", "workspace-write"}, []string{"--oss", "-m", "llama3.2", "--sandbox", "workspace-write"}},
-		{"resume session", "llama3.2", []string{"resume", "session-123"}, []string{"--oss", "-m", "llama3.2", "resume", "session-123"}},
+		{"with model", "llama3.2", nil, []string{"--oss", "--local-provider=ollama", "-m", "llama3.2"}},
+		{"empty model", "", nil, []string{"--oss", "--local-provider=ollama"}},
+		{"with model and profile", "qwen3.5", []string{"-p", "myprofile"}, []string{"--oss", "--local-provider=ollama", "-m", "qwen3.5", "-p", "myprofile"}},
+		{"with sandbox flag", "llama3.2", []string{"--sandbox", "workspace-write"}, []string{"--oss", "--local-provider=ollama", "-m", "llama3.2", "--sandbox", "workspace-write"}},
+		{"resume session", "llama3.2", []string{"resume", "session-123"}, []string{"--oss", "--local-provider=ollama", "-m", "llama3.2", "resume", "session-123"}},
 	}
 
 	for _, tt := range tests {

@@ -82,6 +82,7 @@ type model struct {
 	showingSessionModal bool
 	sessionSelector     selectorModel
 	selectedSessionID   string
+	statusMsg           string // temporary status message shown near help text
 }
 
 func newModel(state *launch.LauncherState) model {
@@ -296,6 +297,11 @@ func (m *model) openCodexSessionModal(selectedModel string) {
 	items := make([]SelectItem, len(sessions))
 	var count int
 	for _, session := range sessions {
+		// Skip sessions from non-Ollama providers (e.g. openai) since they
+		// cannot be resumed against a local Ollama model.
+		if session.Provider != "" && session.Provider != "ollama" {
+			continue
+		}
 		recommended := selectedModel != "" && session.Model != "" && session.Model == selectedModel
 		name := session.Title
 		if session.Model != "" {
@@ -367,6 +373,10 @@ func (m model) View() string {
 	}
 
 	s += "\n" + selectorHelpStyle.Render("↑/↓ navigate • enter launch • → configure • esc quit")
+
+	if m.statusMsg != "" {
+		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "124", Dark: "210"}).Render(m.statusMsg) + "\n"
+	}
 
 	if m.width > 0 {
 		return lipgloss.NewStyle().MaxWidth(m.width).Render(s)
