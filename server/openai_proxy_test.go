@@ -686,3 +686,49 @@ func TestOpenAIPassthroughMiddleware_OllamaKeyFallsBackToStoredOAuth(t *testing.
 		t.Fatalf("expected Authorization %q, got %q", wantAuth, receivedAuth)
 	}
 }
+
+// TestOpenAIPassthroughMiddleware_ChatGPTPathConstruction verifies that when
+// proxying to a base URL with a custom path prefix (e.g.
+// https://chatgpt.com/backend-api/codex), the /v1 prefix is stripped from the
+// Ollama request path and the suffix is appended to the base path — not used
+// as an absolute path replacement.
+//
+// Concretely: incoming /v1/responses + base .../codex
+//   → upstream receives /backend-api/codex/responses
+//   NOT /responses (which would be the wrong result from ResolveReference).
+func TestOpenAIPassthroughMiddleware_ChatGPTPathConstruction(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var upstreamPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer upstream.Close()
+
+	// Fake ChatGPT OAuth JWT so the proxy routes to the custom base URL.
+	fakeJWT := "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIn0.fakesig"
+
+	// Override the ChatGPT codex base URL to point at our mock, but keep the
+	// /backend-api/codex path suffix so we exercise the non-/v1 code path.
+	t.Setenv(chatGPTCodexBaseURLEnv, upstream.URL+"/backend-api/codex")
+	t.Setenv("OPENAI_API_KEY", "")
+
+	body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+fakeJWT)
+	rec := httptest.NewRecorder()
+
+	r := gin.New()
+	r.POST("/v1/responses", openAIPassthroughMiddleware(), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+	r.ServeHTTP(rec, req)
+
+	want := "/backend-api/codex/responses"
+	if upstreamPath != want {
+		t.Fatalf("expected upstream path %q, got %q", want, upstreamPath)
+	}
+}

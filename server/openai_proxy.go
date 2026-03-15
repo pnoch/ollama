@@ -478,18 +478,43 @@ func proxyToOpenAI(c *gin.Context, body []byte, apiKey string) {
 		return
 	}
 
-	// Resolve the full target URL by appending the request path and query.
-	// Strip the leading "/v1" prefix from the Ollama path because both
-	// https://api.openai.com/v1 and https://chatgpt.com/backend-api/codex
-	// already include their own path prefix.
+	// Build the full target URL.
+	//
+	// The incoming Ollama path is always "/v1/<endpoint>" (e.g.
+	// "/v1/responses", "/v1/chat/completions").  We strip the "/v1" prefix
+	// to get the bare endpoint suffix (e.g. "/responses").
+	//
+	// There are two upstream base URL shapes:
+	//
+	//   1. https://api.openai.com/v1  (ends in "/v1")
+	//      The base already contains "/v1", so we can use url.ResolveReference
+	//      with the absolute path "/responses" and get the correct result
+	//      https://api.openai.com/v1/responses.
+	//
+	//   2. https://chatgpt.com/backend-api/codex  (ends in "/codex")
+	//      url.ResolveReference with an absolute path REPLACES the entire
+	//      path, giving https://chatgpt.com/responses — wrong.  We must
+	//      instead append the suffix to the base path manually.
 	upstreamPath := c.Request.URL.Path
 	if strings.HasPrefix(upstreamPath, "/v1") {
 		upstreamPath = upstreamPath[len("/v1"):]
 	}
-	targetURL := base.ResolveReference(&url.URL{
-		Path:     upstreamPath,
-		RawQuery: c.Request.URL.RawQuery,
-	})
+	var targetURL url.URL
+	if strings.HasSuffix(strings.TrimRight(base.Path, "/"), "/v1") {
+		// Case 1: base ends in /v1 — ResolveReference works correctly.
+		targetURL = *base.ResolveReference(&url.URL{
+			Path:     upstreamPath,
+			RawQuery: c.Request.URL.RawQuery,
+		})
+	} else {
+		// Case 2: base has a custom path prefix (e.g. /backend-api/codex).
+		// Append the suffix directly to avoid clobbering the base path.
+		upstreamSuffix := strings.TrimLeft(upstreamPath, "/")
+		targetURL = *base
+		targetURL.Path = strings.TrimRight(base.Path, "/") + "/" + upstreamSuffix
+		targetURL.RawQuery = c.Request.URL.RawQuery
+	}
+	slog.Info("openai proxy: target URL", "url", targetURL.String())
 
 	outReq, err := http.NewRequestWithContext(
 		c.Request.Context(),
