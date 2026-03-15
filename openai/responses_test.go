@@ -2120,3 +2120,161 @@ func TestResponsesStreamConverter_WebSearchCallEvents(t *testing.T) {
 		t.Errorf("toolCallItems len = %d, want 1", len(c.toolCallItems))
 	}
 }
+
+// ─── file_search tests ────────────────────────────────────────────────────────
+
+func TestHasFileSearch(t *testing.T) {
+	tests := []struct {
+		name  string
+		tools []ResponsesTool
+		want  bool
+	}{
+		{
+			name:  "empty",
+			tools: nil,
+			want:  false,
+		},
+		{
+			name:  "function only",
+			tools: []ResponsesTool{{Type: "function", Name: "my_fn"}},
+			want:  false,
+		},
+		{
+			name: "file_search present",
+			tools: []ResponsesTool{
+				{Type: "function", Name: "my_fn"},
+				{Type: "file_search", VectorStoreIDs: []string{"vs_abc"}},
+			},
+			want: true,
+		},
+		{
+			name:  "web_search_preview only",
+			tools: []ResponsesTool{{Type: "web_search_preview"}},
+			want:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, got := HasFileSearch(tt.tools)
+			if got != tt.want {
+				t.Errorf("HasFileSearch() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasFileSearch_ReturnsFirstTool(t *testing.T) {
+	tools := []ResponsesTool{
+		{Type: "file_search", VectorStoreIDs: []string{"vs_first"}, MaxNumResults: 10},
+		{Type: "file_search", VectorStoreIDs: []string{"vs_second"}},
+	}
+	got, ok := HasFileSearch(tools)
+	if !ok {
+		t.Fatal("HasFileSearch returned false, want true")
+	}
+	if len(got.VectorStoreIDs) == 0 || got.VectorStoreIDs[0] != "vs_first" {
+		t.Errorf("VectorStoreIDs[0] = %q, want %q", got.VectorStoreIDs[0], "vs_first")
+	}
+	if got.MaxNumResults != 10 {
+		t.Errorf("MaxNumResults = %d, want 10", got.MaxNumResults)
+	}
+}
+
+func TestFromResponsesRequest_InjectsFileSearchTool(t *testing.T) {
+	req := ResponsesRequest{
+		Model: "llama3.2",
+		Input: ResponsesInput{Items: []ResponsesInputItem{
+			ResponsesInputMessage{
+				Type: "message",
+				Role: "user",
+				Content: []ResponsesContent{
+					ResponsesTextContent{Type: "input_text", Text: "search my docs"},
+				},
+			},
+		}},
+		Tools: []ResponsesTool{
+			{Type: "file_search", VectorStoreIDs: []string{"vs_abc"}, MaxNumResults: 5},
+		},
+	}
+	chatReq, err := FromResponsesRequest(req)
+	if err != nil {
+		t.Fatalf("FromResponsesRequest: %v", err)
+	}
+	// Should have injected a function tool named "file_search".
+	var found bool
+	for _, tool := range chatReq.Tools {
+		if tool.Function.Name == "file_search" {
+			found = true
+			if tool.Function.Parameters.Properties == nil || tool.Function.Parameters.Properties.Len() == 0 {
+				t.Error("file_search tool has empty parameters")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("file_search function tool not injected; tools = %v", chatReq.Tools)
+	}
+}
+
+func TestResponsesStreamConverter_FileSearchCallEvents(t *testing.T) {
+	c := NewResponsesStreamConverter("resp_test", "msg_test", "llama3.2", ResponsesRequest{})
+	chunks := []map[string]any{
+		{"file_id": "file_1", "filename": "doc.txt", "text": "relevant text", "score": 0.95},
+	}
+	events := c.FileSearchCallEvents("fs_1_5", "find docs", chunks)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+
+	// First event: output_item.added with status in_progress.
+	addedEvent := events[0]
+	if addedEvent.Event != "response.output_item.added" {
+		t.Errorf("event[0].Event = %q, want %q", addedEvent.Event, "response.output_item.added")
+	}
+	addedData, _ := addedEvent.Data.(map[string]any)
+	if addedData == nil {
+		t.Fatal("event[0] Data is not map[string]any")
+	}
+	addedItem, _ := addedData["item"].(map[string]any)
+	if addedItem == nil {
+		t.Fatal("event[0] missing item")
+	}
+	if addedItem["type"] != "file_search_call" {
+		t.Errorf("item type = %q, want %q", addedItem["type"], "file_search_call")
+	}
+	if addedItem["status"] != "in_progress" {
+		t.Errorf("item status = %q, want %q", addedItem["status"], "in_progress")
+	}
+	if addedItem["query"] != "find docs" {
+		t.Errorf("item query = %q, want %q", addedItem["query"], "find docs")
+	}
+
+	// Second event: output_item.done with status completed and results.
+	doneEvent := events[1]
+	if doneEvent.Event != "response.output_item.done" {
+		t.Errorf("event[1].Event = %q, want %q", doneEvent.Event, "response.output_item.done")
+	}
+	doneData, _ := doneEvent.Data.(map[string]any)
+	if doneData == nil {
+		t.Fatal("event[1] Data is not map[string]any")
+	}
+	doneItem, _ := doneData["item"].(map[string]any)
+	if doneItem == nil {
+		t.Fatal("event[1] missing item")
+	}
+	if doneItem["status"] != "completed" {
+		t.Errorf("done item status = %q, want %q", doneItem["status"], "completed")
+	}
+	if _, ok := doneItem["results"]; !ok {
+		t.Error("done item missing results field")
+	}
+
+	// outputIndex should be incremented.
+	if c.outputIndex != 1 {
+		t.Errorf("outputIndex = %d, want 1", c.outputIndex)
+	}
+	// Item should be stored in toolCallItems.
+	if len(c.toolCallItems) != 1 {
+		t.Errorf("toolCallItems len = %d, want 1", len(c.toolCallItems))
+	}
+}

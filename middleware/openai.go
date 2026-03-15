@@ -520,6 +520,27 @@ func (w *ResponsesWriter) writeResponseWithWebSearch(data []byte, wsItemID, quer
 	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
 }
 
+// writeResponseWithFileSearch builds a non-streaming Responses API response
+// with a file_search_call output item prepended to the output list.
+func (w *ResponsesWriter) writeResponseWithFileSearch(data []byte, fsItemID, query string, chunks []FileChunkResult) (int, error) {
+	var chatResponse api.ChatResponse
+	if err := json.Unmarshal(data, &chatResponse); err != nil {
+		return 0, err
+	}
+	w.ResponseWriter.Header().Set("Content-Type", "application/json")
+	response := openai.ToResponse(w.model, w.responseID, w.itemID, chatResponse, w.request)
+	completedAt := time.Now().Unix()
+	response.CompletedAt = &completedAt
+	// Prepend the file_search_call output item.
+	fsItem := openai.ResponsesOutputItem{
+		ID:     fsItemID,
+		Type:   "file_search_call",
+		Status: "completed",
+	}
+	response.Output = append([]openai.ResponsesOutputItem{fsItem}, response.Output...)
+	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
+}
+
 func (w *ResponsesWriter) Write(data []byte) (int, error) {
 	code := w.ResponseWriter.Status()
 	if code != http.StatusOK {
@@ -620,6 +641,41 @@ func ResponsesMiddleware() gin.HandlerFunc {
 				inner:      w,
 				req:        req,
 				chatReq:    chatReq,
+			}
+		} else if fsTool, hasFS := openai.HasFileSearch(req.Tools); hasFS {
+			// If the request includes a file_search built-in tool, wrap the writer
+			// with the agent loop that queries the local vector store and emits
+			// file_search_call events. The FileSearcher and FileEmbedder are
+			// injected via gin context keys set by the server before this
+			// middleware runs (see Server.RegisterFileSearchDeps).
+			var searcher FileSearcher
+			var embedder FileEmbedder
+			if s, ok := c.Get("file_searcher"); ok {
+				// Try direct FileSearcher first (e.g. in tests), then fall back to
+				// the []any variant used by the server adapter to avoid import cycles.
+				if fs, ok := s.(FileSearcher); ok {
+					searcher = fs
+				} else if fa, ok := s.(fileSearcherAny); ok {
+					searcher = &fileSearcherAnyAdapter{inner: fa}
+				}
+			}
+			if e, ok := c.Get("file_embedder"); ok {
+				embedder, _ = e.(FileEmbedder)
+			}
+			if searcher != nil && embedder != nil {
+				c.Writer = &ResponsesFileSearchWriter{
+					BaseWriter: BaseWriter{ResponseWriter: c.Writer},
+					inner:      w,
+					req:        req,
+					chatReq:    chatReq,
+					vsIDs:      fsTool.VectorStoreIDs,
+					maxResults: fsTool.MaxNumResults,
+					embedder:   embedder,
+					searcher:   searcher,
+				}
+			} else {
+				// No vector store injected (e.g. test environment) — fall through.
+				c.Writer = w
 			}
 		} else {
 			c.Writer = w
@@ -1005,4 +1061,220 @@ func responsesCallFollowUp(model string, messages []api.Message, tools api.Tools
 		return api.ChatResponse{}, err
 	}
 	return chatResp, nil
+}
+
+// ─── File Search Agent Loop ───────────────────────────────────────────────────
+
+// FileChunkResult is a single search result from a vector store. It mirrors
+// vectorstore.ChunkResult but is defined here to avoid a circular import
+// (server → middleware → server/vectorstore → server).
+type FileChunkResult struct {
+	FileID     string  `json:"file_id"`
+	Filename   string  `json:"filename"`
+	Text       string  `json:"text"`
+	Score      float64 `json:"score"`
+	ChunkIndex int     `json:"chunk_index"`
+}
+
+// FileSearcher is the interface the middleware uses to query a vector store.
+// It is satisfied by a thin adapter on *vectorstore.Store defined in
+// server/routes_vectorstore.go.
+type FileSearcher interface {
+	SearchChunks(vsIDs []string, queryVec []float32, maxResults int) ([]FileChunkResult, error)
+}
+
+// fileSearcherAny is an internal adapter that accepts a FileSearcher-like
+// interface where SearchChunks returns []any instead of []FileChunkResult.
+// This lets the server adapter avoid importing the middleware package.
+type fileSearcherAny interface {
+	SearchChunks(vsIDs []string, queryVec []float32, maxResults int) ([]any, error)
+}
+
+// fileSearcherAnyAdapter wraps a fileSearcherAny and converts its results
+// to []FileChunkResult for use by ResponsesFileSearchWriter.
+type fileSearcherAnyAdapter struct{ inner fileSearcherAny }
+
+func (a *fileSearcherAnyAdapter) SearchChunks(vsIDs []string, queryVec []float32, maxResults int) ([]FileChunkResult, error) {
+	raw, err := a.inner.SearchChunks(vsIDs, queryVec, maxResults)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]FileChunkResult, 0, len(raw))
+	for _, r := range raw {
+		m, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		var cr FileChunkResult
+		cr.FileID, _ = m["file_id"].(string)
+		cr.Filename, _ = m["filename"].(string)
+		cr.Text, _ = m["text"].(string)
+		cr.Score, _ = m["score"].(float64)
+		if ci, ok := m["chunk_index"].(int64); ok {
+			cr.ChunkIndex = int(ci)
+		} else if ci, ok := m["chunk_index"].(float64); ok {
+			cr.ChunkIndex = int(ci)
+		}
+		out = append(out, cr)
+	}
+	return out, nil
+}
+
+// FileEmbedder is the interface the middleware uses to embed a query string.
+type FileEmbedder interface {
+	EmbedText(text string) ([]float32, error)
+}
+
+// ResponsesFileSearchWriter intercepts Responses API responses that contain a
+// file_search tool call, queries the local vector store, feeds the results back
+// to the model as a tool message, and emits the correct Responses API streaming
+// events (file_search_call, then the final text response).
+//
+// This makes file_search work identically for both cloud and local models.
+type ResponsesFileSearchWriter struct {
+	BaseWriter
+	inner      *ResponsesWriter
+	req        openai.ResponsesRequest
+	chatReq    *api.ChatRequest
+	vsIDs      []string
+	maxResults int
+	embedder   FileEmbedder
+	searcher   FileSearcher
+}
+
+const maxResponsesFileSearchLoops = 3
+
+func (w *ResponsesFileSearchWriter) Write(data []byte) (int, error) {
+	code := w.ResponseWriter.Status()
+	if code != http.StatusOK {
+		return w.inner.writeError(data)
+	}
+	var chatResponse api.ChatResponse
+	if err := json.Unmarshal(data, &chatResponse); err != nil {
+		return 0, err
+	}
+	fsCall, hasFS := findResponsesFileSearchCall(chatResponse.Message.ToolCalls)
+	if !hasFS {
+		return w.inner.writeResponse(data)
+	}
+	return w.runFileSearchLoop(chatResponse, fsCall)
+}
+
+func (w *ResponsesFileSearchWriter) runFileSearchLoop(initialResp api.ChatResponse, initialCall api.ToolCall) (int, error) {
+	followUpMessages := make([]api.Message, 0, len(w.chatReq.Messages)+maxResponsesFileSearchLoops*2)
+	followUpMessages = append(followUpMessages, w.chatReq.Messages...)
+	followUpTools := append(api.Tools(nil), w.chatReq.Tools...)
+
+	currentResp := initialResp
+	currentCall := initialCall
+	stream := w.req.Stream != nil && *w.req.Stream
+
+	if stream {
+		w.inner.converter.ResetFirstWrite()
+	}
+
+	for loop := 1; loop <= maxResponsesFileSearchLoops; loop++ {
+		query := responsesExtractQuery(&currentCall)
+		if query == "" {
+			break
+		}
+
+		// Embed the query.
+		queryVec, err := w.embedder.EmbedText(query)
+		if err != nil {
+			break
+		}
+
+		// Search the vector store.
+		maxR := w.maxResults
+		if maxR <= 0 {
+			maxR = 20
+		}
+		chunks, err := w.searcher.SearchChunks(w.vsIDs, queryVec, maxR)
+		if err != nil {
+			break
+		}
+
+		fsItemID := fmt.Sprintf("fs_%d_%d", loop, len(query))
+
+		// Emit file_search_call events (streaming only; non-streaming builds them at end).
+		if stream {
+			events := w.inner.converter.FileSearchCallEvents(fsItemID, query, any(chunks))
+			for _, ev := range events {
+				if err := w.inner.writeEvent(ev.Event, ev.Data); err != nil {
+					return 0, err
+				}
+			}
+		}
+
+		// Build follow-up messages: assistant tool call + tool result.
+		assistantMsg := api.Message{
+			Role:      "assistant",
+			ToolCalls: []api.ToolCall{currentCall},
+		}
+		if currentResp.Message.Content != "" {
+			assistantMsg.Content = currentResp.Message.Content
+		}
+		toolResultMsg := api.Message{
+			Role:       "tool",
+			Content:    responsesFormatFileSearchResults(chunks),
+			ToolCallID: currentCall.ID,
+		}
+		followUpMessages = append(followUpMessages, assistantMsg, toolResultMsg)
+
+		followUpResp, err := responsesCallFollowUp(w.chatReq.Model, followUpMessages, followUpTools, w.chatReq.Options)
+		if err != nil {
+			break
+		}
+
+		nextCall, hasMore := findResponsesFileSearchCall(followUpResp.Message.ToolCalls)
+		if !hasMore {
+			if stream {
+				finalData, err := json.Marshal(followUpResp)
+				if err != nil {
+					return 0, err
+				}
+				return w.inner.writeResponse(finalData)
+			}
+			finalData, err := json.Marshal(followUpResp)
+			if err != nil {
+				return 0, err
+			}
+			return w.inner.writeResponseWithFileSearch(finalData, fsItemID, query, chunks)
+		}
+		currentResp = followUpResp
+		currentCall = nextCall
+	}
+
+	// Fallback: emit the last response as-is.
+	fallbackData, err := json.Marshal(currentResp)
+	if err != nil {
+		return 0, err
+	}
+	return w.inner.writeResponse(fallbackData)
+}
+
+// findResponsesFileSearchCall finds the first file_search tool call in a list.
+func findResponsesFileSearchCall(toolCalls []api.ToolCall) (api.ToolCall, bool) {
+	for _, tc := range toolCalls {
+		if tc.Function.Name == "file_search" {
+			return tc, true
+		}
+	}
+	return api.ToolCall{}, false
+}
+
+// responsesFormatFileSearchResults formats chunk results as a plain-text tool message.
+func responsesFormatFileSearchResults(chunks []FileChunkResult) string {
+	var sb strings.Builder
+	for i, c := range chunks {
+		fmt.Fprintf(&sb, "%d. [%s] (score: %.3f)\n", i+1, c.Filename, c.Score)
+		text := c.Text
+		runes := []rune(text)
+		if len(runes) > 500 {
+			text = string(runes[:500]) + "..."
+		}
+		fmt.Fprintf(&sb, "   %s\n\n", text)
+	}
+	return sb.String()
 }

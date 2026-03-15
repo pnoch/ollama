@@ -338,10 +338,10 @@ type ResponsesText struct {
 // built-in hosted tools:
 //   - "function"            — user-defined function (Name/Description/Parameters present)
 //   - "web_search_preview"  — hosted web search (SearchContextSize/AllowedDomains may be set)
-//   - "file_search"         — hosted vector-store search (not yet implemented locally)
+//   - "file_search"         — hosted vector-store search (VectorStoreIDs/MaxNumResults may be set)
 //   - "computer_use_preview"— hosted computer control (not yet implemented locally)
 type ResponsesTool struct {
-	Type        string         `json:"type"` // "function", "web_search_preview", ...
+	Type        string         `json:"type"` // "function", "web_search_preview", "file_search", ...
 	Name        string         `json:"name"`
 	Description *string        `json:"description"` // nullable but required
 	Strict      *bool          `json:"strict"`      // nullable but required
@@ -350,6 +350,13 @@ type ResponsesTool struct {
 	// web_search_preview fields
 	SearchContextSize string   `json:"search_context_size,omitempty"` // "low", "medium", "high"
 	AllowedDomains    []string `json:"allowed_domains,omitempty"`
+
+	// file_search fields
+	VectorStoreIDs []string `json:"vector_store_ids,omitempty"`
+	MaxNumResults  int      `json:"max_num_results,omitempty"` // default 20
+	// EmbedModel is an ollama-specific extension: the embedding model to use
+	// when searching. Defaults to "nomic-embed-text" if omitted.
+	EmbedModel string `json:"embed_model,omitempty"`
 }
 
 // HasWebSearchPreview reports whether the tool list contains a web_search_preview
@@ -357,6 +364,17 @@ type ResponsesTool struct {
 func HasWebSearchPreview(tools []ResponsesTool) (ResponsesTool, bool) {
 	for _, t := range tools {
 		if strings.HasPrefix(t.Type, "web_search") {
+			return t, true
+		}
+	}
+	return ResponsesTool{}, false
+}
+
+// HasFileSearch reports whether the tool list contains a file_search built-in
+// tool, and returns the first one found.
+func HasFileSearch(tools []ResponsesTool) (ResponsesTool, bool) {
+	for _, t := range tools {
+		if t.Type == "file_search" {
 			return t, true
 		}
 	}
@@ -578,6 +596,12 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 			// The ResponsesWebSearchWriter in middleware/openai.go intercepts
 			// web_search tool calls and executes them server-side.
 			tools = append(tools, webSearchFunctionTool())
+		case t.Type == "file_search":
+			// Translate file_search → file_search function tool.
+			// The ResponsesFileSearchWriter in middleware/openai.go intercepts
+			// file_search tool calls, queries the local vector store, and feeds
+			// results back to the model.
+			tools = append(tools, fileSearchFunctionTool())
 		default:
 			// function tools and unrecognised built-ins pass through as-is.
 			tool, err := convertTool(t)
@@ -663,6 +687,29 @@ func webSearchFunctionTool() api.Tool {
 		Function: api.ToolFunction{
 			Name:        "web_search",
 			Description: "Search the web for current information. Use this when you need up-to-date information that may not be in your training data.",
+			Parameters: api.ToolFunctionParameters{
+				Type:       "object",
+				Properties: props,
+				Required:   []string{"query"},
+			},
+		},
+	}
+}
+
+// fileSearchFunctionTool returns the api.Tool definition for the built-in file_search
+// function. This is injected into the tool list when the client requests
+// file_search so that local models can emit structured file_search calls.
+func fileSearchFunctionTool() api.Tool {
+	props := api.NewToolPropertiesMap()
+	props.Set("query", api.ToolProperty{
+		Type:        api.PropertyType{"string"},
+		Description: "The search query to find relevant information in uploaded files",
+	})
+	return api.Tool{
+		Type: "function",
+		Function: api.ToolFunction{
+			Name:        "file_search",
+			Description: "Search through uploaded files and documents to find relevant information. Use this when the user's question can be answered from their uploaded files.",
 			Parameters: api.ToolFunctionParameters{
 				Type:       "object",
 				Properties: props,
@@ -1359,6 +1406,43 @@ func (c *ResponsesStreamConverter) WebSearchCallEvents(wsItemID, query string, r
 
 	// Store for buildFinalOutput / response.completed
 	c.toolCallItems = append(c.toolCallItems, wsItem)
+	c.outputIndex++
+	return events
+}
+
+// FileSearchCallEvents emits the Responses API streaming events for a
+// file_search_call item: output_item.added (in_progress), output_item.done
+// (completed with results). The caller (ResponsesFileSearchWriter) must call
+// this before the final text-content events so that output indices are correct.
+//
+// chunks is []middleware.FileChunkResult but typed as []any here to avoid an
+// import cycle; the caller passes the slice as []any.
+func (c *ResponsesStreamConverter) FileSearchCallEvents(fsItemID, query string, chunks any) []ResponsesStreamEvent {
+	var events []ResponsesStreamEvent
+	// response.output_item.added (status: in_progress)
+	events = append(events, c.newEvent("response.output_item.added", map[string]any{
+		"output_index": c.outputIndex,
+		"item": map[string]any{
+			"id":     fsItemID,
+			"type":   "file_search_call",
+			"status": "in_progress",
+			"query":  query,
+		},
+	}))
+	// response.output_item.done (status: completed)
+	fsItem := map[string]any{
+		"id":     fsItemID,
+		"type":   "file_search_call",
+		"status": "completed",
+		"query":  query,
+		"results": chunks,
+	}
+	events = append(events, c.newEvent("response.output_item.done", map[string]any{
+		"output_index": c.outputIndex,
+		"item":         fsItem,
+	}))
+	// Store for buildFinalOutput / response.completed
+	c.toolCallItems = append(c.toolCallItems, fsItem)
 	c.outputIndex++
 	return events
 }

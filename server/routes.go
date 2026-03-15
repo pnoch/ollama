@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -46,6 +47,7 @@ import (
 	"github.com/ollama/ollama/model/renderers"
 	"github.com/ollama/ollama/server/internal/client/ollama"
 	"github.com/ollama/ollama/server/internal/registry"
+	"github.com/ollama/ollama/server/vectorstore"
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/thinking"
 	"github.com/ollama/ollama/tools"
@@ -100,6 +102,10 @@ type Server struct {
 	addr          net.Addr
 	sched         *Scheduler
 	defaultNumCtx int
+	aliasesOnce sync.Once
+	aliases     *store
+	aliasesErr  error
+	vectorStore *vectorstore.Store
 }
 
 func init() {
@@ -1699,7 +1705,7 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	r.POST("/v1/embeddings", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.EmbeddingsMiddleware(), s.EmbedHandler)
 	r.GET("/v1/models", middleware.ListMiddleware(), s.ListHandler)
 	r.GET("/v1/models/:model", cloudModelPathPassthroughMiddleware(cloudErrRemoteModelDetailsUnavailable), middleware.RetrieveMiddleware(), s.ShowHandler)
-	r.POST("/v1/responses", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ResponsesMiddleware(), s.ChatHandler)
+	r.POST("/v1/responses", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.FileSearchDepsMiddleware(""), middleware.ResponsesMiddleware(), s.ChatHandler)
 	r.POST("/v1/responses/compact", s.ResponsesCompactHandler)
 	// OpenAI-compatible image generation endpoints
 	r.POST("/v1/images/generations", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ImageGenerationsMiddleware(), s.GenerateHandler)
@@ -1707,6 +1713,17 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 
 	// Inference (Anthropic compatibility)
 	r.POST("/v1/messages", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.AnthropicMessagesMiddleware(), s.ChatHandler)
+
+	// Vector store API — local implementation of OpenAI's /v1/vector_stores.
+	// These routes are always local; there is no cloud passthrough.
+	r.POST("/v1/vector_stores", s.CreateVectorStoreHandler)
+	r.GET("/v1/vector_stores", s.ListVectorStoresHandler)
+	r.GET("/v1/vector_stores/:id", s.GetVectorStoreHandler)
+	r.DELETE("/v1/vector_stores/:id", s.DeleteVectorStoreHandler)
+	r.POST("/v1/vector_stores/:id/files", s.UploadVectorStoreFileHandler)
+	r.GET("/v1/vector_stores/:id/files", s.ListVectorStoreFilesHandler)
+	r.GET("/v1/vector_stores/:id/files/:file_id", s.GetVectorStoreFileHandler)
+	r.DELETE("/v1/vector_stores/:id/files/:file_id", s.DeleteVectorStoreFileHandler)
 
 	if rc != nil {
 		// wrap old with new
@@ -1758,7 +1775,19 @@ func Serve(ln net.Listener) error {
 	}
 
 	s := &Server{addr: ln.Addr()}
-
+	// Initialize the local vector store database.
+	{
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("vectorstore: home dir: %w", err)
+		}
+		vs, err := vectorstore.Open(filepath.Join(home, ".ollama", "vectorstore.db"))
+		if err != nil {
+			slog.Warn("vector store unavailable", "error", err)
+		} else {
+			s.vectorStore = vs
+		}
+	}
 	var rc *ollama.Registry
 	if useClient2 {
 		var err error
