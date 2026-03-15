@@ -23,6 +23,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -191,7 +193,7 @@ func openAIPassthroughMiddleware() gin.HandlerFunc {
 		//  3. Any other real credential in the incoming Authorization header.
 		incomingAuthHeader := c.GetHeader("Authorization")
 		incomingToken := strings.TrimSpace(strings.TrimPrefix(incomingAuthHeader, "Bearer "))
-		slog.Info("openai proxy: credential resolution",
+		slog.Debug("openai proxy: credential resolution",
 			"path", c.Request.URL.Path,
 			"incoming_auth_present", incomingAuthHeader != "",
 			"incoming_token_prefix", safePrefix(incomingToken, 8),
@@ -204,12 +206,12 @@ func openAIPassthroughMiddleware() gin.HandlerFunc {
 		if isRealCredential(incomingAuthHeader) && isChatGPTOAuthToken(incomingToken) {
 			// Always prefer the OAuth JWT so it routes to chatgpt.com.
 			apiKey = incomingToken
-			slog.Info("openai proxy: using incoming OAuth JWT")
+			slog.Debug("openai proxy: using incoming OAuth JWT")
 		}
 		if apiKey == "" {
 			apiKey = openAIAPIKey()
 			if apiKey != "" {
-				slog.Info("openai proxy: using stored/env API key",
+				slog.Debug("openai proxy: using stored/env API key",
 					"key_prefix", safePrefix(apiKey, 8),
 					"is_jwt", isChatGPTOAuthToken(apiKey),
 				)
@@ -219,10 +221,10 @@ func openAIPassthroughMiddleware() gin.HandlerFunc {
 			// Last resort: use whatever real credential Codex sent.
 			if isRealCredential(incomingAuthHeader) {
 				apiKey = incomingToken
-				slog.Info("openai proxy: falling back to incoming auth header")
+				slog.Debug("openai proxy: falling back to incoming auth header")
 			}
 		}
-		slog.Info("openai proxy: resolved credential",
+		slog.Debug("openai proxy: resolved credential",
 			"apiKey_prefix", safePrefix(apiKey, 8),
 			"apiKey_is_jwt", isChatGPTOAuthToken(apiKey),
 			"apiKey_empty", apiKey == "",
@@ -231,7 +233,7 @@ func openAIPassthroughMiddleware() gin.HandlerFunc {
 			// No API key configured — skip proxy and let the local handler
 			// attempt to serve the request (it will fail gracefully if the
 			// model is not found locally).
-			slog.Info("openai proxy: no credential, falling through to local handler")
+			slog.Debug("openai proxy: no credential, falling through to local handler")
 			c.Next()
 			return
 		}
@@ -255,7 +257,7 @@ func openAIPassthroughMiddleware() gin.HandlerFunc {
 		}
 
 		isLocal := isModelLocalOrCloud(modelName)
-		slog.Info("openai proxy: model check",
+		slog.Debug("openai proxy: model check",
 			"model", modelName,
 			"is_local_or_cloud", isLocal,
 			"will_proxy", !isLocal,
@@ -393,7 +395,14 @@ func (w *modelsBufferedWriter) Write(b []byte) (int, error) {
 // API.  Returns an empty slice on any error so the caller can still serve the
 // local model list.
 func fetchOpenAIModels(ctx context.Context, apiKey string) []openaiModelEntry {
-	baseURL := openAIProxyBaseURL()
+	// Use the credential-aware base URL so that ChatGPT OAuth tokens route to
+	// chatgpt.com/backend-api/codex/models instead of api.openai.com/v1/models.
+	baseURL := upstreamBaseURLForCredential(apiKey)
+
+	// Build the /models URL using the same logic as proxyToOpenAI: when the
+	// base ends in /v1 we can simply append "/models"; when it has a custom
+	// path prefix (e.g. /backend-api/codex) we also append "/models" — the
+	// trim+join approach works for both cases.
 	targetURL := strings.TrimRight(baseURL, "/") + "/models"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
@@ -470,6 +479,12 @@ func upstreamBaseURLForCredential(apiKey string) string {
 // proxyToOpenAI forwards the current request to the upstream OpenAI API and
 // streams the response back to the caller.
 func proxyToOpenAI(c *gin.Context, body []byte, apiKey string) {
+	proxyToOpenAIWithRetry(c, body, apiKey, false)
+}
+
+// proxyToOpenAIWithRetry is the internal implementation that optionally retries
+// once with a freshly-loaded credential when the upstream returns 401.
+func proxyToOpenAIWithRetry(c *gin.Context, body []byte, apiKey string, isRetry bool) {
 	baseURL := upstreamBaseURLForCredential(apiKey)
 
 	base, err := url.Parse(baseURL)
@@ -514,7 +529,7 @@ func proxyToOpenAI(c *gin.Context, body []byte, apiKey string) {
 		targetURL.Path = strings.TrimRight(base.Path, "/") + "/" + upstreamSuffix
 		targetURL.RawQuery = c.Request.URL.RawQuery
 	}
-	slog.Info("openai proxy: target URL", "url", targetURL.String())
+	slog.Debug("openai proxy: target URL", "url", targetURL.String())
 
 	outReq, err := http.NewRequestWithContext(
 		c.Request.Context(),
@@ -540,14 +555,14 @@ func proxyToOpenAI(c *gin.Context, body []byte, apiKey string) {
 		creds := loadStoredCredentials()
 		if creds.AccountID != "" && outReq.Header.Get("ChatGPT-Account-ID") == "" {
 			outReq.Header.Set("ChatGPT-Account-ID", creds.AccountID)
-			slog.Info("openai proxy: injected ChatGPT-Account-ID",
+			slog.Debug("openai proxy: injected ChatGPT-Account-ID",
 				"account_id", creds.AccountID,
 			)
 		}
 	}
 
-	// Log all outgoing headers for debugging.
-	{
+	// Log all outgoing headers at DEBUG level.
+	if slog.Default().Enabled(c.Request.Context(), slog.LevelDebug) {
 		var headerPairs []any
 		for k, vs := range outReq.Header {
 			if strings.EqualFold(k, "Authorization") {
@@ -556,7 +571,7 @@ func proxyToOpenAI(c *gin.Context, body []byte, apiKey string) {
 				headerPairs = append(headerPairs, k, strings.Join(vs, ","))
 			}
 		}
-		slog.Info("openai proxy: outgoing headers", headerPairs...)
+		slog.Debug("openai proxy: outgoing headers", headerPairs...)
 	}
 
 	// Forward optional organisation and project headers.
@@ -582,6 +597,57 @@ func proxyToOpenAI(c *gin.Context, body []byte, apiKey string) {
 		return
 	}
 	defer resp.Body.Close()
+
+	// --- 401 retry: token may have been refreshed by Codex in the background.
+	if resp.StatusCode == http.StatusUnauthorized && !isRetry && isChatGPTOAuthToken(apiKey) {
+		// Drain and discard the error body.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		// Re-read the stored credential; Codex may have refreshed the JWT.
+		newCreds := loadStoredCredentials()
+		if newCreds.APIKey != "" && newCreds.APIKey != apiKey {
+			slog.Info("openai proxy: 401 received, retrying with refreshed token")
+			proxyToOpenAIWithRetry(c, body, newCreds.APIKey, true)
+			return
+		}
+	}
+
+	// --- 429 usage-limit: rewrite the error into a clean human-readable message.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr == nil {
+			var usageErr struct {
+				Error struct {
+					Type     string `json:"type"`
+					ResetsAt *int64 `json:"resets_at"`
+					PlanType string `json:"plan_type"`
+				} `json:"error"`
+			}
+			if jsonErr := json.Unmarshal(respBody, &usageErr); jsonErr == nil &&
+				(usageErr.Error.Type == "usage_limit_reached" || usageErr.Error.Type == "usage_not_included") {
+				msg := "You've hit your usage limit for this model."
+				if usageErr.Error.ResetsAt != nil {
+					resetTime := time.Unix(*usageErr.Error.ResetsAt, 0)
+					msg = fmt.Sprintf("You've hit your usage limit. Try again at %s.",
+						resetTime.Format("Jan 2, 2006 3:04 PM MST"))
+				}
+				slog.Info("openai proxy: usage limit reached",
+					"type", usageErr.Error.Type,
+					"plan_type", usageErr.Error.PlanType,
+					"resets_at", usageErr.Error.ResetsAt,
+				)
+				copyProxyResponseHeaders(c.Writer.Header(), resp.Header)
+				c.JSON(http.StatusTooManyRequests, gin.H{"error": msg})
+				return
+			}
+		}
+		// Not a usage-limit error — forward the original body.
+		copyProxyResponseHeaders(c.Writer.Header(), resp.Header)
+		c.Status(resp.StatusCode)
+		_, _ = c.Writer.Write(respBody)
+		return
+	}
 
 	copyProxyResponseHeaders(c.Writer.Header(), resp.Header)
 	c.Status(resp.StatusCode)

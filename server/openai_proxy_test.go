@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -730,5 +731,117 @@ func TestOpenAIPassthroughMiddleware_ChatGPTPathConstruction(t *testing.T) {
 	want := "/backend-api/codex/responses"
 	if upstreamPath != want {
 		t.Fatalf("expected upstream path %q, got %q", want, upstreamPath)
+	}
+}
+
+// TestProxyToOpenAI_401RetryWithRefreshedToken verifies that when the upstream
+// returns 401 and a newer token is available in auth.json, the proxy retries
+// the request once with the refreshed credential.
+func TestProxyToOpenAI_401RetryWithRefreshedToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Fake JWTs — old (stale) and new (refreshed).
+	oldJWT := "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJvbGQifQ.oldsig"
+	newJWT := "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJuZXcifQ.newsig"
+
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		auth := r.Header.Get("Authorization")
+		if auth == "Bearer "+oldJWT {
+			// First call: simulate stale token.
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid token"}`))
+			return
+		}
+		// Second call with refreshed token: succeed.
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"resp-ok"}`))
+	}))
+	defer upstream.Close()
+
+	// Write auth.json with the NEW token (simulating a background refresh).
+	home := t.TempDir()
+	if err := os.MkdirAll(home+"/.codex", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authJSON := `{"tokens":{"access_token":"` + newJWT + `"}}`
+	if err := os.WriteFile(home+"/.codex/auth.json", []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "")
+	// Point the ChatGPT codex base URL to our mock.
+	t.Setenv("OLLAMA_CHATGPT_CODEX_BASE_URL", upstream.URL)
+
+	router := gin.New()
+	router.POST("/v1/responses", openAIPassthroughMiddleware(), func(c *gin.Context) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "local not found"})
+	})
+
+	body := `{"model":"gpt-5.4","input":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// Codex sends the OLD (stale) JWT.
+	req.Header.Set("Authorization", "Bearer "+oldJWT)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 after retry, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if callCount != 2 {
+		t.Fatalf("expected 2 upstream calls (initial + retry), got %d", callCount)
+	}
+}
+
+// TestProxyToOpenAI_429UsageLimitRewrite verifies that a 429 response with
+// type=usage_limit_reached is rewritten into a clean human-readable error.
+func TestProxyToOpenAI_429UsageLimitRewrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	fakeJWT := "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.sig"
+	resetAt := int64(1800000000) // some future unix timestamp
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		body := fmt.Sprintf(`{"error":{"type":"usage_limit_reached","resets_at":%d,"plan_type":"free"}}`, resetAt)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer upstream.Close()
+
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OLLAMA_CHATGPT_CODEX_BASE_URL", upstream.URL)
+
+	router := gin.New()
+	router.POST("/v1/responses", openAIPassthroughMiddleware(), func(c *gin.Context) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "local not found"})
+	})
+
+	body := `{"model":"gpt-5.4","input":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+fakeJWT)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", rec.Code)
+	}
+
+	var result struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	// The error message should be human-readable, not raw JSON.
+	if !strings.Contains(result.Error, "usage limit") {
+		t.Fatalf("expected usage limit message, got %q", result.Error)
+	}
+	// Should NOT contain raw JSON from upstream.
+	if strings.Contains(result.Error, "usage_limit_reached") {
+		t.Fatalf("error message should not contain raw JSON type, got %q", result.Error)
 	}
 }
