@@ -37,8 +37,14 @@ import (
 
 const (
 	// defaultOpenAIProxyBaseURL is the upstream used when
-	// OLLAMA_OPENAI_PROXY_BASE_URL is not set.
+	// OLLAMA_OPENAI_PROXY_BASE_URL is not set and the credential is an
+	// OpenAI API key (sk-...).
 	defaultOpenAIProxyBaseURL = "https://api.openai.com/v1"
+
+	// chatGPTCodexBaseURL is the upstream used when the credential is a
+	// ChatGPT OAuth JWT token.  This matches the base_url that the Codex
+	// Rust client uses when auth_mode == AuthMode::Chatgpt.
+	chatGPTCodexBaseURL = "https://chatgpt.com/backend-api/codex"
 
 	// openAIProxyBaseURLEnv is the environment variable that overrides the
 	// upstream OpenAI base URL.
@@ -356,10 +362,39 @@ func fetchOpenAIModels(ctx context.Context, apiKey string) []openaiModelEntry {
 	return result.Data
 }
 
+// isChatGPTOAuthToken reports whether the credential looks like a ChatGPT
+// OAuth JWT access token rather than an OpenAI API key.
+//
+// ChatGPT OAuth tokens are JWTs: three base64url-encoded segments separated by
+// dots, where the first segment decodes to a JSON header beginning with
+// {"alg":...}.  In practice they always start with "eyJ" (base64url of '{').
+// OpenAI API keys always start with "sk-".
+func isChatGPTOAuthToken(key string) bool {
+	// Cheap heuristic: JWTs start with "eyJ" (base64url({"alg"...)).
+	// OpenAI API keys start with "sk-".  Anything else is treated as an
+	// API key and sent to api.openai.com.
+	return strings.HasPrefix(key, "eyJ") || strings.Count(key, ".") >= 2
+}
+
+// upstreamBaseURLForCredential returns the correct upstream base URL for the
+// given credential.  ChatGPT OAuth JWTs use chatgpt.com/backend-api/codex;
+// OpenAI API keys use the configured OLLAMA_OPENAI_PROXY_BASE_URL (default:
+// https://api.openai.com/v1).
+func upstreamBaseURLForCredential(apiKey string) string {
+	// Allow explicit override regardless of credential type.
+	if v := strings.TrimSpace(os.Getenv(openAIProxyBaseURLEnv)); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	if isChatGPTOAuthToken(apiKey) {
+		return chatGPTCodexBaseURL
+	}
+	return defaultOpenAIProxyBaseURL
+}
+
 // proxyToOpenAI forwards the current request to the upstream OpenAI API and
 // streams the response back to the caller.
 func proxyToOpenAI(c *gin.Context, body []byte, apiKey string) {
-	baseURL := openAIProxyBaseURL()
+	baseURL := upstreamBaseURLForCredential(apiKey)
 
 	base, err := url.Parse(baseURL)
 	if err != nil {
@@ -368,8 +403,9 @@ func proxyToOpenAI(c *gin.Context, body []byte, apiKey string) {
 	}
 
 	// Resolve the full target URL by appending the request path and query.
-	// Strip the leading "/v1" prefix from the Ollama path because the base
-	// URL already includes "/v1" (e.g. https://api.openai.com/v1).
+	// Strip the leading "/v1" prefix from the Ollama path because both
+	// https://api.openai.com/v1 and https://chatgpt.com/backend-api/codex
+	// already include their own path prefix.
 	upstreamPath := c.Request.URL.Path
 	if strings.HasPrefix(upstreamPath, "/v1") {
 		upstreamPath = upstreamPath[len("/v1"):]

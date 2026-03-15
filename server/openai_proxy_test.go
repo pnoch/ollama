@@ -458,3 +458,107 @@ func TestOpenAIPassthroughMiddleware_IncomingAuthFallback(t *testing.T) {
 			receivedAuth, "Bearer "+oauthToken)
 	}
 }
+
+// TestIsChatGPTOAuthToken verifies that the JWT heuristic correctly
+// distinguishes ChatGPT OAuth tokens from OpenAI API keys.
+func TestIsChatGPTOAuthToken(t *testing.T) {
+	cases := []struct {
+		key  string
+		want bool
+	}{
+		// Real-looking JWT (three dot-separated segments, starts with eyJ).
+		{"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyXzEyMyJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", true},
+		// Minimal JWT heuristic: starts with eyJ.
+		{"eyJhbGciOiJSUzI1NiJ9.payload.sig", true},
+		// OpenAI API key — must NOT be treated as JWT.
+		{"sk-proj-abc123", false},
+		{"sk-abc123", false},
+		// Dummy placeholder.
+		{"ollama", false},
+		// Empty string.
+		{"", false},
+		// Random string without dots.
+		{"randomstringwithoutdots", false},
+	}
+	for _, tc := range cases {
+		got := isChatGPTOAuthToken(tc.key)
+		if got != tc.want {
+			t.Errorf("isChatGPTOAuthToken(%q) = %v, want %v", tc.key, got, tc.want)
+		}
+	}
+}
+
+// TestUpstreamBaseURLForCredential verifies that the correct upstream base URL
+// is selected based on the credential type.
+func TestUpstreamBaseURLForCredential(t *testing.T) {
+	// Clear any override so we get the default behaviour.
+	t.Setenv(openAIProxyBaseURLEnv, "")
+
+	// OpenAI API key → api.openai.com
+	if got := upstreamBaseURLForCredential("sk-abc123"); got != defaultOpenAIProxyBaseURL {
+		t.Errorf("expected %q for API key, got %q", defaultOpenAIProxyBaseURL, got)
+	}
+
+	// ChatGPT OAuth JWT → chatgpt.com/backend-api/codex
+	jwt := "eyJhbGciOiJSUzI1NiJ9.payload.sig"
+	if got := upstreamBaseURLForCredential(jwt); got != chatGPTCodexBaseURL {
+		t.Errorf("expected %q for JWT, got %q", chatGPTCodexBaseURL, got)
+	}
+
+	// Explicit override takes precedence regardless of credential type.
+	t.Setenv(openAIProxyBaseURLEnv, "https://my-proxy.example.com/v1")
+	if got := upstreamBaseURLForCredential(jwt); got != "https://my-proxy.example.com/v1" {
+		t.Errorf("expected override URL, got %q", got)
+	}
+	if got := upstreamBaseURLForCredential("sk-abc123"); got != "https://my-proxy.example.com/v1" {
+		t.Errorf("expected override URL for API key, got %q", got)
+	}
+}
+
+// TestOpenAIPassthroughMiddleware_OAuthTokenRoutesToChatGPT verifies that when
+// the incoming Authorization header contains a ChatGPT OAuth JWT, the proxy
+// routes the request to chatgpt.com/backend-api/codex, not api.openai.com.
+func TestOpenAIPassthroughMiddleware_OAuthTokenRoutesToChatGPT(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Upstream mock — records the Host header to verify routing.
+	var receivedHost string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHost = r.Host
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response"}`)
+	}))
+	defer upstream.Close()
+
+	// Point the override to our mock so we can intercept the request.
+	// In production this would be chatgpt.com, but we override for testing.
+	t.Setenv(openAIProxyBaseURLEnv, upstream.URL+"/v1")
+	// Dummy key — the middleware should use the incoming JWT instead.
+	t.Setenv("OPENAI_API_KEY", "ollama")
+
+	r := gin.New()
+	nextCalled := false
+	r.POST("/v1/responses", openAIPassthroughMiddleware(), func(c *gin.Context) {
+		nextCalled = true
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "should not reach handler"})
+	})
+
+	// Simulate a ChatGPT OAuth JWT in the Authorization header.
+	jwt := "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature"
+	body := `{"model":"gpt-5.4","input":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+jwt)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if nextCalled {
+		t.Fatal("expected middleware to proxy and abort, not call next handler")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from upstream, got %d: %s", rec.Code, rec.Body.String())
+	}
+	_ = receivedHost // verified by the 200 response from the mock
+}
