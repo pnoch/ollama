@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -400,5 +401,60 @@ func TestOpenAIModelsPassthroughMiddleware_UpstreamError(t *testing.T) {
 	}
 	if result.Data[0].ID != "local-model" {
 		t.Errorf("expected local-model, got %q", result.Data[0].ID)
+	}
+}
+
+// TestOpenAIPassthroughMiddleware_IncomingAuthFallback verifies that when
+// OPENAI_API_KEY is the dummy "ollama" placeholder, the middleware falls back
+// to the Authorization header already present in the incoming request.
+// This handles ChatGPT OAuth sessions where Codex sends its OAuth access_token
+// as the Bearer credential when the user switches to a cloud model (gpt-5.4,
+// o3, etc.) inside the TUI.
+func TestOpenAIPassthroughMiddleware_IncomingAuthFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Upstream mock that records the Authorization header it receives.
+	var receivedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response"}`)
+	}))
+	defer upstream.Close()
+
+	t.Setenv(openAIProxyBaseURLEnv, upstream.URL+"/v1")
+	// Set the dummy key — the middleware should prefer the incoming header.
+	t.Setenv("OPENAI_API_KEY", "ollama")
+
+	r := gin.New()
+	nextCalled := false
+	r.POST("/v1/responses", openAIPassthroughMiddleware(), func(c *gin.Context) {
+		// Should never reach here — the middleware should proxy and abort.
+		nextCalled = true
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "should not reach handler"})
+	})
+
+	// "gpt-5.4" is not a local Ollama model, so the middleware should proxy it.
+	// The incoming request carries a real OAuth token (JWT-like, not "ollama").
+	body := `{"model":"gpt-5.4","input":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// Simulate a ChatGPT OAuth access_token (long JWT-like string).
+	oauthToken := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.realtoken.sig"
+	req.Header.Set("Authorization", "Bearer "+oauthToken)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if nextCalled {
+		t.Fatal("expected middleware to proxy and abort, not call next handler")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from upstream, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if receivedAuth != "Bearer "+oauthToken {
+		t.Errorf("upstream did not receive the incoming OAuth token; got %q, want %q",
+			receivedAuth, "Bearer "+oauthToken)
 	}
 }

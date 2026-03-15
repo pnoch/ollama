@@ -143,7 +143,23 @@ func openAIPassthroughMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		// Determine the credential to use for proxying.  Priority:
+		//  1. OPENAI_API_KEY env var or stored key in ~/.codex/auth.json
+		//  2. The Authorization header that Codex already sent in the request
+		//     (e.g. a ChatGPT OAuth access_token for cloud model sessions).
+		//
+		// This handles the case where the user is logged in via ChatGPT OAuth
+		// and switches to a cloud model (gpt-5.4, o3, etc.) inside Codex:
+		// Codex sends its OAuth token in Authorization, but OPENAI_API_KEY is
+		// not set (only the dummy 'ollama' placeholder is in the env).
 		apiKey := openAIAPIKey()
+		if apiKey == "" || apiKey == "ollama" {
+			// Fall back to the credential Codex already sent in the request.
+			if incomingAuth := c.GetHeader("Authorization"); isRealCredential(incomingAuth) {
+				apiKey = strings.TrimPrefix(incomingAuth, "Bearer ")
+				apiKey = strings.TrimSpace(apiKey)
+			}
+		}
 		if apiKey == "" {
 			// No API key configured — skip proxy and let the local handler
 			// attempt to serve the request (it will fail gracefully if the
